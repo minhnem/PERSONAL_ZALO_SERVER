@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Environment variables
+.env
+.env.test
+
+# Playwright / Puppeteer User Data (Phiên đăng nhập Zalo, cache trình duyệt)
+userData/
+userData_*/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# IDEs and Editors
+.vscode/
+.idea/
+
+# Test scripts and scratchpads
+scratch_*.js
+test-zalo*.js
+
+# Playwright screenshots
+*.png
