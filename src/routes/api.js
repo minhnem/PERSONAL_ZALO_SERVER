@@ -6,6 +6,7 @@ import { zaloMessageQueue } from '../config/queue.js';
 import { Contact } from '../models/Contact.js';
 import { Account } from '../models/Account.js';
 import { Campaign } from '../models/Campaign.js';
+import { Group } from '../models/Group.js';
 
 // Đảm bảo thư mục uploads tồn tại
 const uploadDir = path.join(process.cwd(), 'uploads');
@@ -89,6 +90,9 @@ router.delete('/accounts/:id', async (req, res) => {
 
     // Giải phóng rác: Xóa toàn bộ chiến dịch chạy dở liên quan đến tài khoản này
     await Campaign.deleteMany({ accountId: accountId });
+
+    // Giải phóng rác: Xóa toàn bộ nhóm liên quan đến tài khoản này
+    await Group.deleteMany({ accountId: accountId });
 
     res.json({ success: true, message: 'Đã xóa tài khoản và giải phóng bộ nhớ DB' });
   } catch (error) {
@@ -182,7 +186,7 @@ router.get('/contacts', async (req, res) => {
 });
 
 // Import the functions from playwright worker
-import { getLoginQRCode, closeBrowser, syncZaloContacts } from '../scripts/playwright.worker.js';
+import { getLoginQRCode, closeBrowser, syncZaloContacts, syncZaloGroups } from '../scripts/playwright.worker.js';
 
 // API: Trigger contact sync (Synchronous execution for Smart Yield)
 router.post('/accounts/sync', async (req, res) => {
@@ -199,6 +203,24 @@ router.post('/accounts/sync', async (req, res) => {
     res.json({ success: true, message: 'Đã quét và đồng bộ danh bạ thành công' });
   } catch (error) {
     // Đảm bảo đóng trình duyệt nếu có lỗi
+    if (accountId) {
+      await closeBrowser(accountId).catch(() => console.error("Failed to close browser on error"));
+    }
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// API: Trigger group sync (Synchronous execution for Smart Yield)
+router.post('/accounts/sync-groups', async (req, res) => {
+  const { accountId } = req.body;
+  try {
+    if (!accountId) throw new Error('Thiếu accountId');
+
+    await syncZaloGroups(accountId);
+    await closeBrowser(accountId);
+
+    res.json({ success: true, message: 'Đã quét và đồng bộ nhóm thành công' });
+  } catch (error) {
     if (accountId) {
       await closeBrowser(accountId).catch(() => console.error("Failed to close browser on error"));
     }
@@ -249,6 +271,16 @@ router.post('/accounts/sync-session', async (req, res) => {
     res.json({ success: true, message: 'Copy Profile vật lý thành công' });
   } catch (error) {
     console.error('[API] Lỗi khi đồng bộ session:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// API: Get groups for an account
+router.get('/groups/:accountId', async (req, res) => {
+  try {
+    const groups = await Group.find({ accountId: req.params.accountId });
+    res.json({ success: true, data: groups });
+  } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });

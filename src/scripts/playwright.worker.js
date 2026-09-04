@@ -1,6 +1,7 @@
 import { chromium } from 'playwright-extra';
 import stealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { Contact } from '../models/Contact.js';
+import { Group } from '../models/Group.js';
 import { randomizeImageHash, deleteTempImage } from '../utils/imageModifier.js';
 import path from 'path';
 import fs from 'fs';
@@ -293,20 +294,28 @@ export const syncZaloContacts = async (accountId = 'default') => {
     const page = context.pages().find(p => p.url().includes('chat.zalo.me'));
     if (!page) throw new Error('Không tìm thấy trang chat.zalo.me');
 
-    console.log('[Playwright Worker] Đang chuyển sang tab Danh bạ...');
+    console.log('[Playwright Worker] Đang chuyển sang tab Danh bạ (để quét Bạn bè)...');
+    
+    // Đóng popup cản đường
     try {
-      // 1. Click icon Danh Bạ ở thanh menu trái
-      const contactIcon = page.locator('[title="Danh bạ"], [data-translate-inner="STR_TAB_CONTACT"], .icn-Contact').first();
-      await contactIcon.click({ timeout: 5000 });
-      await page.waitForTimeout(1000); // Đợi menu phụ mở ra
+      const closeBtn = page.locator('.modal-close, [icon*="lose" i], [icon*="close" i], button[title*="Đóng" i]').first();
+      if (await closeBtn.isVisible({ timeout: 2000 })) {
+        await closeBtn.click();
+        await page.waitForTimeout(1000);
+      }
+    } catch (e) { }
 
-      // 2. Click vào mục "Danh sách bạn bè" (Tránh việc Zalo đang lưu ở tab Nhóm)
+    try {
+      // Click icon Danh Bạ
+      const contactIcon = page.locator('[title*="Danh bạ" i], [data-translate-inner="STR_TAB_CONTACT"], .icn-Contact, [icon*="Contact" i], [icon*="contact" i]').first();
+      await contactIcon.click({ timeout: 10000 });
+      await page.waitForTimeout(1500); 
+
+      // Click vào "Danh sách bạn bè"
       try {
-        // Dùng Regex không phân biệt hoa thường để tìm text, an toàn hơn so với title=""
         const friendListTab = page.getByText(/Danh sách bạn bè/i).first();
         await friendListTab.click({ timeout: 4000 });
       } catch (err) {
-        console.log('[Playwright Worker] Không tìm thấy text "Danh sách bạn bè", thử locator dự phòng...');
         const friendListFallback = page.locator('[title="Danh sách bạn bè"], [title="Danh sách Bạn bè"], [data-translate-inner="STR_CONTACT_LIST"], [icon="icn-Add-Friend"]').first();
         await friendListFallback.click({ timeout: 4000 });
       }
@@ -315,106 +324,85 @@ export const syncZaloContacts = async (accountId = 'default') => {
       console.log('[Playwright Worker] CẢNH BÁO: Lỗi điều hướng Danh Bạ:', e.message);
     }
 
-    await page.waitForTimeout(3000); // Đợi DOM cập nhật
+    await page.waitForTimeout(2000); 
 
-    console.log('[Playwright Worker] Bắt đầu quét danh bạ từ DOM (có Auto-Scroll)...');
+    console.log('[Playwright Worker] Bắt đầu quét BẠN BÈ bằng con lăn chuột (Hardware Mouse Wheel)...');
 
-    const rawContacts = await page.evaluate(async () => {
-      return new Promise((resolve) => {
-        const contactsMap = new Map(); // Dùng Map để lọc trùng lặp theo name
+    const rawContacts = await (async () => {
+      const contactsMap = new Map();
+      let unchangedScrolls = 0;
+      let lastCount = 0;
 
-        let lastCount = 0;
-        let unchangedScrolls = 0;
-        const maxUnchangedScrolls = 4; // Nếu cuộn 4 lần mà không tăng người -> chạm đáy
-
-        const extractContacts = () => {
-          // Lấy tất cả avatar trên màn hình
-          const allImages = document.querySelectorAll('img');
-          allImages.forEach(img => {
-            const avatar = img.src;
-            if (!avatar || avatar.includes('icon') || avatar.includes('svg')) return;
-
-            // Dò ngược lên để tìm thẻ chứa Tên
-            let container = img.parentElement;
-            let name = '';
-            for (let i = 0; i < 5; i++) {
-              if (container) {
-                const nameEl = container.querySelector('.name, .conv-item-title__name, .header-title, [data-translate-inner="STR_CONTACT_ITEM_NAME"], .truncate, .text-truncate, .contact-name');
-                if (nameEl && nameEl.innerText) {
-                  name = nameEl.innerText.trim();
-                  break;
-                }
-                container = container.parentElement;
-              }
-            }
-
-            if (!name || name.length < 2) return;
-
-            // BỘ LỌC RÁC: Loại bỏ các tên hệ thống, thanh điều hướng
-            // (Đã mở khóa 'Cloud của tôi', 'Truyền File', 'My Documents' để user test gửi tin nhắn)
-            const ignoreList = ['Tin nhắn', 'Danh bạ', 'To-Do', 'Giao việc', 'Zalo Video'];
-            if (ignoreList.includes(name)) return;
-
-            if (name.length === 1) return;
-
-            // CỐT LÕI ĐỂ LOẠI BỎ NHÓM: 
-            // Các nhóm và tin nhắn nằm trong danh sách chat bên trái (class: msg-item)
-            // Danh bạ bạn bè nằm ở panel bên phải, không có class msg-item
-            let isMsgItem = false;
-            let current = img.parentElement;
-            while (current && current !== document.body) {
-              if (current.classList && (current.classList.contains('msg-item') || current.classList.contains('chat-item'))) {
-                isMsgItem = true;
-                break;
-              }
-              current = current.parentElement;
-            }
-
-            // Bỏ qua tất cả các liên hệ nằm trong phần tin nhắn (vì đó là nơi chứa nhóm)
-            if (isMsgItem) return;
-
-            const zaloId = `zalo_id_${name}`;
-
-            if (!contactsMap.has(name)) {
-              contactsMap.set(name, { zaloId, name, avatar });
-            }
-          });
-        };
-
-        const scrollInterval = setInterval(() => {
-          extractContacts(); // Quét màn hình hiện tại
-
-          const currentCount = contactsMap.size;
-          if (currentCount === lastCount) {
-            unchangedScrolls++;
-          } else {
-            unchangedScrolls = 0;
-            lastCount = currentCount;
+      // Tìm tọa độ vùng chứa an toàn để trỏ chuột
+      const boundingBox = await page.evaluate(() => {
+        const grids = Array.from(document.querySelectorAll('.ReactVirtualized__Grid, .contact-list, [data-id="div_Contact_List"]'));
+        let maxArea = 0;
+        let target = null;
+        for (const grid of grids) {
+          const rect = grid.getBoundingClientRect();
+          if (rect.left > 300 && (rect.width * rect.height > maxArea)) {
+            maxArea = rect.width * rect.height;
+            target = rect;
           }
-
-          // Cố gắng cuộn các thẻ div có thanh cuộn
-          const scrollableContainers = document.querySelectorAll('.ReactVirtualized__Grid, [style*="overflow: auto"], [style*="overflow-y: auto"], .contact-list');
-          let scrolled = false;
-          for (const container of scrollableContainers) {
-            if (container.scrollHeight > container.clientHeight) {
-              container.scrollTop += 800; // Cuộn mạnh xuống
-              scrolled = true;
-            }
-          }
-
-          // Thoát nếu chạm đáy hoặc số lượng quá lớn (tránh treo)
-          if (unchangedScrolls >= maxUnchangedScrolls || currentCount > 5000) {
-            clearInterval(scrollInterval);
-            resolve(Array.from(contactsMap.values()));
-          }
-        }, 1000); // 1 giây mỗi nhịp cuộn để Zalo kịp load API
+        }
+        return target ? { x: target.left + target.width / 2, y: target.top + target.height / 2 } : null;
       });
-    });
 
-    console.log(`[Playwright Worker] Vét cạn thành công! Đã quét được ${rawContacts.length} liên hệ.`);
+      if (boundingBox) {
+         await page.mouse.move(boundingBox.x, boundingBox.y);
+      } else {
+         await page.mouse.move(800, 400);
+      }
+
+      while (unchangedScrolls < 5 && contactsMap.size < 5000) {
+        const visibleContacts = await page.evaluate(() => {
+          const results = [];
+          const grids = Array.from(document.querySelectorAll('.ReactVirtualized__Grid, .contact-list, [data-id="div_Contact_List"]'));
+          let mainContainer = null;
+          let maxArea = 0;
+          for (const grid of grids) {
+            const rect = grid.getBoundingClientRect();
+            if (rect.left > 300 && (rect.width * rect.height > maxArea)) {
+              maxArea = rect.width * rect.height;
+              mainContainer = grid;
+            }
+          }
+          if (!mainContainer) return results;
+
+          const nameEls = mainContainer.querySelectorAll('.name, .conv-item-title__name, .truncate, .text-truncate, .item-title, [data-id="div_Item_Name"]');
+          nameEls.forEach(nameEl => {
+            let name = nameEl.innerText ? nameEl.innerText.trim().split('\n')[0] : '';
+            if (!name || name.length < 2) return;
+            const ignoreList = ['Tìm kiếm', 'Cài đặt', 'Thử ngay', 'Tìm hiểu thêm', 'Lời mời kết bạn', 'Từ danh bạ máy', 'Tất cả', 'Tên (A-Z)', 'Tên (Z-A)', 'Hoạt động'];
+            if (ignoreList.includes(name) || name.length === 1) return;
+            results.push({ name, zaloId: `zalo_id_${name}`, avatar: '' });
+          });
+          return results;
+        });
+
+        visibleContacts.forEach(c => {
+          if (!contactsMap.has(c.name)) contactsMap.set(c.name, c);
+        });
+
+        if (contactsMap.size === lastCount) {
+          unchangedScrolls++;
+        } else {
+          unchangedScrolls = 0;
+          lastCount = contactsMap.size;
+        }
+
+        if (unchangedScrolls < 5) {
+           // Giả lập lăn chuột hệt như người thật
+           await page.mouse.wheel(0, Math.floor(Math.random() * 400) + 400);
+           await page.waitForTimeout(Math.floor(Math.random() * 400) + 800);
+        }
+      }
+      return Array.from(contactsMap.values());
+    })();
+
+    console.log(`[Playwright Worker] Vét cạn an toàn thành công! Đã quét được ${rawContacts.length} liên hệ.`);
 
     if (rawContacts.length > 0) {
-      // Chuẩn bị data
       const contactsToSave = rawContacts.map(c => ({
         accountId,
         zaloId: c.zaloId,
@@ -422,11 +410,10 @@ export const syncZaloContacts = async (accountId = 'default') => {
         avatar: c.avatar,
         type: 'friend'
       }));
+      
+      console.log(`\n[Playwright Worker] ===== DỮ LIỆU BẠN BÈ QUÉT ĐƯỢC TRƯỚC KHI LƯU =====\n`, JSON.stringify(contactsToSave, null, 2), `\n==================================================================\n`);
 
-      // Xóa danh bạ cũ để tránh trùng lặp nếu quét lại
       await Contact.deleteMany({ accountId });
-
-      // Lưu hàng loạt vào MongoDB
       await Contact.insertMany(contactsToSave);
       console.log(`[Playwright Worker] Cập nhật DB thành công! Đã lưu ${contactsToSave.length} liên hệ.`);
     } else {
@@ -438,8 +425,143 @@ export const syncZaloContacts = async (accountId = 'default') => {
     throw error;
   }
 };
-//   } catch (error) {
-//   console.error('[Playwright Worker] Lỗi đồng bộ nhóm:', error);
-//   throw error;
-// }
-// };
+
+export const syncZaloGroups = async (accountId = 'default') => {
+  try {
+    const context = await initBrowser(accountId);
+    const page = context.pages().find(p => p.url().includes('chat.zalo.me'));
+    if (!page) throw new Error('Không tìm thấy trang chat.zalo.me');
+
+    console.log('[Playwright Worker] Đang chuyển sang tab Danh bạ (để quét Nhóm)...');
+    
+    // [BỔ SUNG] Đóng các popup Welcome/Quảng cáo nếu có để không bị che nút bấm
+    try {
+      const closeBtn = page.locator('.modal-close, [icon*="lose" i], [icon*="close" i], button[title*="Đóng" i]').first();
+      if (await closeBtn.isVisible({ timeout: 2000 })) {
+        await closeBtn.click();
+        console.log(`[Playwright Worker] Đã đóng Popup quảng cáo cản đường!`);
+        await page.waitForTimeout(1000);
+      }
+    } catch (e) { }
+
+    try {
+      // Cập nhật thêm nhiều selector nhận diện icon Danh bạ để tương thích các phiên bản Zalo khác nhau
+      const contactIcon = page.locator('[title*="Danh bạ" i], [data-translate-inner="STR_TAB_CONTACT"], .icn-Contact, [icon*="Contact" i], [icon*="contact" i]').first();
+      // Tăng thời gian chờ lên 10s đề phòng mạng chậm hoặc Zalo tải lâu
+      await contactIcon.click({ timeout: 10000 });
+      await page.waitForTimeout(1500); 
+
+      // Click vào mục "Danh sách nhóm và cộng đồng"
+      try {
+        const groupListTab = page.getByText(/Danh sách nhóm/i).first();
+        await groupListTab.click({ timeout: 4000 });
+      } catch (err) {
+        const groupListFallback = page.locator('[title="Danh sách nhóm"], [data-translate-inner="STR_GROUP_LIST"]').first();
+        await groupListFallback.click({ timeout: 4000 });
+      }
+      console.log('[Playwright Worker] Đã vào giao diện Danh sách nhóm.');
+    } catch (e) {
+      console.log('[Playwright Worker] CẢNH BÁO: Lỗi điều hướng Danh sách nhóm:', e.message);
+    }
+
+    await page.waitForTimeout(2000); 
+
+    console.log('[Playwright Worker] Bắt đầu quét NHÓM bằng con lăn chuột (Hardware Mouse Wheel)...');
+
+    const rawGroups = await (async () => {
+      let groupsMap = new Map();
+      let unchangedScrolls = 0;
+      let lastCount = 0;
+
+      // Tìm tọa độ vùng chứa an toàn để trỏ chuột
+      const boundingBox = await page.evaluate(() => {
+        const grids = Array.from(document.querySelectorAll('.ReactVirtualized__Grid, .contact-list, [data-id="div_Contact_List"]'));
+        let maxArea = 0;
+        let target = null;
+        for (const grid of grids) {
+          const rect = grid.getBoundingClientRect();
+          if (rect.left > 300 && (rect.width * rect.height > maxArea)) {
+            maxArea = rect.width * rect.height;
+            target = rect;
+          }
+        }
+        return target ? { x: target.left + target.width / 2, y: target.top + target.height / 2 } : null;
+      });
+
+      if (boundingBox) {
+         await page.mouse.move(boundingBox.x, boundingBox.y);
+      } else {
+         await page.mouse.move(800, 400);
+      }
+
+      while (unchangedScrolls < 5 && groupsMap.size < 2000) {
+        const visibleGroups = await page.evaluate(() => {
+          const results = [];
+          const grids = Array.from(document.querySelectorAll('.ReactVirtualized__Grid, .contact-list, [data-id="div_Contact_List"]'));
+          let mainContainer = null;
+          let maxArea = 0;
+          for (const grid of grids) {
+            const rect = grid.getBoundingClientRect();
+            if (rect.left > 300 && (rect.width * rect.height > maxArea)) {
+              maxArea = rect.width * rect.height;
+              mainContainer = grid;
+            }
+          }
+          if (!mainContainer) return results;
+
+          const nameEls = mainContainer.querySelectorAll('.name, .conv-item-title__name, .truncate, .text-truncate, .item-title, [data-id="div_Item_Name"]');
+          nameEls.forEach(nameEl => {
+            let name = nameEl.innerText ? nameEl.innerText.trim().split('\n')[0] : '';
+            if (!name || name.length < 2) return;
+            const ignoreList = ['Tìm kiếm', 'Cài đặt', 'Thử ngay', 'Tìm hiểu thêm', 'Tất cả', 'Phân loại', 'Chưa đọc', 'Hoạt động (mới → cũ)', 'Hoạt động (cũ → mới)'];
+            if (ignoreList.includes(name)) return;
+            results.push({ name, zaloId: `zalo_id_group_${name}`, avatar: '' });
+          });
+          return results;
+        });
+
+        visibleGroups.forEach(g => {
+          if (!groupsMap.has(g.name)) groupsMap.set(g.name, g);
+        });
+
+        if (groupsMap.size === lastCount) {
+          unchangedScrolls++;
+        } else {
+          unchangedScrolls = 0;
+          lastCount = groupsMap.size;
+        }
+
+        if (unchangedScrolls < 5) {
+           await page.mouse.wheel(0, Math.floor(Math.random() * 400) + 400);
+           await page.waitForTimeout(Math.floor(Math.random() * 400) + 800);
+        }
+      }
+      return Array.from(groupsMap.values());
+    })();
+
+    console.log(`[Playwright Worker] Vét cạn an toàn thành công! Đã quét được ${rawGroups.length} nhóm.`);
+
+    if (rawGroups.length > 0) {
+      await Group.deleteMany({ accountId });
+
+      const groupsToSave = rawGroups.map(g => ({
+        accountId,
+        zaloId: g.zaloId,
+        name: g.name,
+        avatar: g.avatar,
+        type: 'group'
+      }));
+
+      console.log(`\n[Playwright Worker] ===== DỮ LIỆU NHÓM QUÉT ĐƯỢC TRƯỚC KHI LƯU =====\n`, JSON.stringify(groupsToSave, null, 2), `\n==================================================================\n`);
+      
+      await Group.insertMany(groupsToSave);
+      console.log(`[Playwright Worker] Cập nhật DB thành công! Đã lưu ${groupsToSave.length} nhóm.`);
+    } else {
+      console.log('[Playwright Worker] Không quét được nhóm nào.');
+    }
+    return true;
+  } catch (error) {
+    console.error('[Playwright Worker] Lỗi đồng bộ nhóm:', error);
+    throw error;
+  }
+};
