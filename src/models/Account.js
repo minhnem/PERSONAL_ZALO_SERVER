@@ -17,6 +17,15 @@ const accountSchema = new mongoose.Schema({
     type: String, // Path to Playwright userData folder
     required: true
   },
+  zcaCredentials: {
+    type: Object, // { cookie, imei, userAgent } cho đăng nhập zca-js
+    default: null
+  },
+  zcaStatus: {
+    type: String,
+    enum: ['connected', 'disconnected', 'error'],
+    default: 'disconnected'
+  },
   lastSyncAt: Date,
   createdAt: {
     type: Date,

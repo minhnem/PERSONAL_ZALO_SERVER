@@ -7,6 +7,7 @@ import { Contact } from '../models/Contact.js';
 import { Account } from '../models/Account.js';
 import { Campaign } from '../models/Campaign.js';
 import { Group } from '../models/Group.js';
+import { GroupMember } from '../models/GroupMember.js';
 
 // Đảm bảo thư mục uploads tồn tại
 const uploadDir = path.join(process.cwd(), 'uploads');
@@ -79,6 +80,26 @@ router.get('/accounts', async (req, res) => {
   }
 });
 
+// API: Create placeholder account
+router.post('/accounts', async (req, res) => {
+  try {
+    const { phoneNumber, name } = req.body;
+    if (!phoneNumber) return res.status(400).json({ error: 'Missing phoneNumber' });
+
+    const newAccount = new Account({
+      phoneNumber,
+      name: name || phoneNumber,
+      sessionFolder: `./userData/zalo_${phoneNumber}`,
+      status: 'disconnected'
+    });
+    await newAccount.save();
+
+    res.json({ success: true, data: newAccount });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // API: Delete account
 router.delete('/accounts/:id', async (req, res) => {
   try {
@@ -114,7 +135,7 @@ router.get('/accounts/status/:id', async (req, res) => {
 // API: Create and Start a Campaign
 router.post('/campaigns', upload.single('image'), async (req, res) => {
   try {
-    let { accountId, name, messageTemplate, recipients } = req.body;
+    let { accountId, name, messageTemplate, recipients, groupName } = req.body;
 
     // Parse recipients if it's sent as a JSON string from FormData
     if (typeof recipients === 'string') {
@@ -153,6 +174,7 @@ router.post('/campaigns', upload.single('image'), async (req, res) => {
         to: recipient.name,
         message: messageTemplate,
         imagePath: imagePath, // Truyền đường dẫn ảnh cho worker
+        groupName: groupName, // Truyền groupName nếu có (dành cho thành viên nhóm)
         timestamp: Date.now()
       });
     }
@@ -186,7 +208,15 @@ router.get('/contacts', async (req, res) => {
 });
 
 // Import the functions from playwright worker
-import { getLoginQRCode, closeBrowser, syncZaloContacts, syncZaloGroups } from '../scripts/playwright.worker.js';
+import { getLoginQRCode, closeBrowser, syncZaloContacts, syncZaloGroups, syncGroupMembers } from '../scripts/playwright.worker.js';
+
+// Import the functions from zca-js worker (API trực tiếp, không cần browser)
+import {
+  initZaloApi, syncFriendsViaApi, syncGroupsViaApi,
+  syncGroupMembersViaApi, sendMessageViaApi,
+  extractCredentialsFromPlaywright, getZaloApiStatus,
+  closeZaloApi
+} from '../scripts/zalo-api.worker.js';
 
 // API: Trigger contact sync (Synchronous execution for Smart Yield)
 router.post('/accounts/sync', async (req, res) => {
@@ -220,6 +250,24 @@ router.post('/accounts/sync-groups', async (req, res) => {
     await closeBrowser(accountId);
 
     res.json({ success: true, message: 'Đã quét và đồng bộ nhóm thành công' });
+  } catch (error) {
+    if (accountId) {
+      await closeBrowser(accountId).catch(() => console.error("Failed to close browser on error"));
+    }
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// API: Trigger group members sync
+router.post('/accounts/sync-group-members', async (req, res) => {
+  const { accountId, groupId, groupName } = req.body;
+  try {
+    if (!accountId || !groupId || !groupName) throw new Error('Thiếu accountId, groupId hoặc groupName');
+
+    await syncGroupMembers(accountId, groupId, groupName);
+    await closeBrowser(accountId);
+
+    res.json({ success: true, message: 'Đã quét và đồng bộ thành viên nhóm thành công' });
   } catch (error) {
     if (accountId) {
       await closeBrowser(accountId).catch(() => console.error("Failed to close browser on error"));
@@ -280,6 +328,25 @@ router.get('/groups/:accountId', async (req, res) => {
   try {
     const groups = await Group.find({ accountId: req.params.accountId });
     res.json({ success: true, data: groups });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// API: Get members of a specific group
+router.get('/groups/:groupId/members', async (req, res) => {
+  try {
+    const members = await GroupMember.find({ groupId: req.params.groupId });
+    // Format to match Contact structure so UI can reuse logic
+    const data = members.map(m => ({
+      id: m.zaloId,
+      name: m.name,
+      type: 'group_member',
+      avatar: m.avatar,
+      groupId: m.groupId,
+      accountId: m.accountId
+    }));
+    res.json({ success: true, data });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -346,6 +413,153 @@ router.delete('/campaigns/:id', async (req, res) => {
     res.json({ success: true, message: 'Đã xóa chiến dịch' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ========================================================================================
+// ZCA-JS API ENDPOINTS (V2) — Quét data & gửi tin bằng Internal API thay vì Browser
+// ========================================================================================
+
+// API: Kết nối zca-js cho một tài khoản (Extract credentials từ Playwright session)
+router.post('/accounts/zca-connect', async (req, res) => {
+  const { accountId } = req.body;
+  try {
+    if (!accountId) throw new Error('Thiếu accountId');
+
+    // Bước 1: Extract cookies, imei, userAgent từ Playwright session đang chạy
+    const credentials = await extractCredentialsFromPlaywright(accountId);
+
+    // Bước 2: Lưu credentials vào DB để tái sử dụng sau
+    await Account.findOneAndUpdate(
+      { phoneNumber: accountId },
+      { zcaCredentials: credentials }
+    );
+
+    // Bước 3: Đăng nhập zca-js bằng credentials vừa extract
+    await initZaloApi(accountId, credentials);
+
+    res.json({ success: true, message: 'Kết nối API Zalo thành công!' });
+  } catch (error) {
+    console.error('[API] Lỗi kết nối zca-js:', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// API: Kiểm tra trạng thái kết nối zca-js
+router.get('/accounts/zca-status/:id', async (req, res) => {
+  try {
+    const status = getZaloApiStatus(req.params.id);
+    res.json({ success: true, status });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// API: Ngắt kết nối zca-js
+router.post('/accounts/zca-disconnect', async (req, res) => {
+  const { accountId } = req.body;
+  try {
+    if (!accountId) throw new Error('Thiếu accountId');
+    await closeZaloApi(accountId);
+    res.json({ success: true, message: 'Đã ngắt kết nối API Zalo.' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// API: Quét danh bạ bạn bè bằng zca-js (V2)
+router.post('/accounts/sync-v2', async (req, res) => {
+  const { accountId } = req.body;
+  try {
+    if (!accountId) throw new Error('Thiếu accountId');
+    const result = await syncFriendsViaApi(accountId);
+    res.json({ success: true, message: `Đã quét ${result.count} bạn bè (UID thật) qua API.` });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// API: Quét nhóm bằng zca-js (V2)
+router.post('/accounts/sync-groups-v2', async (req, res) => {
+  const { accountId } = req.body;
+  try {
+    if (!accountId) throw new Error('Thiếu accountId');
+    const result = await syncGroupsViaApi(accountId);
+    res.json({ success: true, message: `Đã quét ${result.count} nhóm (ID thật) qua API.` });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// API: Quét thành viên nhóm bằng zca-js (V2) — Kể cả thành viên ẨN
+router.post('/accounts/sync-group-members-v2', async (req, res) => {
+  const { accountId, groupId } = req.body;
+  try {
+    if (!accountId || !groupId) throw new Error('Thiếu accountId hoặc groupId');
+    const result = await syncGroupMembersViaApi(accountId, groupId);
+    res.json({
+      success: true,
+      message: `Đã quét ${result.count} thành viên nhóm "${result.groupName}" (UID thật, kể cả ẩn) qua API.`
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// API: Tạo chiến dịch gửi tin bằng UID qua zca-js (V2)
+router.post('/campaigns-v2', upload.single('image'), async (req, res) => {
+  try {
+    let { accountId, name, messageTemplate, recipients, groupName } = req.body;
+
+    // Parse recipients if it's sent as a JSON string from FormData
+    if (typeof recipients === 'string') {
+      recipients = JSON.parse(recipients);
+    }
+
+    if (!accountId || !messageTemplate || !recipients || recipients.length === 0) {
+      return res.status(400).json({ error: 'Thiếu thông tin bắt buộc' });
+    }
+
+    // Lấy đường dẫn file ảnh nếu có
+    const imagePath = req.file ? req.file.path : null;
+
+    // Prepare recipients for DB
+    const dbRecipients = recipients.map(c => ({
+      contactId: c.id,
+      status: 'pending'
+    }));
+
+    // Create Campaign
+    const campaign = new Campaign({
+      accountId,
+      name: name || `Chiến dịch API ${new Date().toLocaleString('vi-VN')}`,
+      messageTemplate,
+      recipients: dbRecipients,
+      status: 'running'
+    });
+    await campaign.save();
+
+    // Dispatch jobs to Queue (dùng job name mới: sendCampaignMessageV2)
+    for (const recipient of recipients) {
+      await zaloMessageQueue.add('sendCampaignMessageV2', {
+        campaignId: campaign._id,
+        accountId,
+        contactId: recipient.id,
+        recipientUid: recipient.id, // UID thật — chính xác 100%
+        recipientName: recipient.name,
+        message: messageTemplate,
+        imagePath: imagePath,
+        timestamp: Date.now()
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Đã bắt đầu chiến dịch API gửi tới ${recipients.length} người (bằng UID).`,
+      campaignId: campaign._id
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 

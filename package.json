@@ -31,7 +31,9 @@
     "playwright": "^1.62.1",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "xlsx": "^0.18.5"
+    "sharp": "^0.35.4",
+    "xlsx": "^0.18.5",
+    "zca-js": "^2.2.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"

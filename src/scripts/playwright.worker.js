@@ -2,6 +2,7 @@ import { chromium } from 'playwright-extra';
 import stealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { Contact } from '../models/Contact.js';
 import { Group } from '../models/Group.js';
+import { GroupMember } from '../models/GroupMember.js';
 import { randomizeImageHash, deleteTempImage } from '../utils/imageModifier.js';
 import path from 'path';
 import fs from 'fs';
@@ -285,6 +286,189 @@ export const sendMessageToZalo = async (accountId = 'default', to, messageTempla
   }
 };
 
+// Hàm gửi tin nhắn chuyên biệt cho thành viên nhóm (người lạ)
+export const sendGroupMemberMessageToZalo = async (accountId = 'default', groupName, memberName, messageTemplate, imagePath = null) => {
+  try {
+    const context = await initBrowser(accountId);
+    const page = context.pages().find(p => p.url().includes('chat.zalo.me'));
+    if (!page) throw new Error('Không tìm thấy trang chat.zalo.me');
+
+    console.log(`[Playwright Worker] Đang tìm nhóm "${groupName}" để nhắn cho thành viên "${memberName}"...`);
+
+    // 1. Đóng popup
+    try {
+      const closeBtn = page.locator('.modal-close, [icon*="lose" i], [icon*="close" i], button[title*="Đóng" i]').first();
+      if (await closeBtn.isVisible({ timeout: 2000 })) {
+        await closeBtn.click();
+        await page.waitForTimeout(1000);
+      }
+    } catch (e) { }
+
+    // 2. Tìm nhóm
+    const globalSearchSelector = '#contact-search-input, #global-search-input, [data-translate-placeholder="STR_SEARCH_CONTACT"], [placeholder*="Tìm kiếm" i]';
+    await page.locator(globalSearchSelector).first().click();
+    await page.locator(globalSearchSelector).first().fill('');
+    await page.locator(globalSearchSelector).first().pressSequentially(groupName, { delay: 150 });
+    
+    await page.waitForTimeout(1500);
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(2000);
+
+    // 3. Mở danh sách thành viên (nếu chưa mở)
+    try {
+      // Dựa vào ảnh chụp Zalo Web, nút "3 thành viên" nằm ngay dưới tên nhóm. Mình sẽ ưu tiên click nút đó trước.
+      const headerMemberBtn = page.locator('.chat-header-info, .chat-info, .header-subtitle, [data-id="div_Header_Subtitle"]').getByText(/thành viên/i).first();
+      
+      if (await headerMemberBtn.isVisible({ timeout: 2000 })) {
+        await headerMemberBtn.click();
+        await page.waitForTimeout(1500);
+      } else {
+        // Fallback: Mở info panel bên phải rồi click tab Thành viên
+        const infoIcon = page.locator('[title*="Thông tin hội thoại" i], [title*="Thông tin nhóm" i], [icon*="Window-Right" i], .header-btn[title*="Thông tin"]').first();
+        if (await infoIcon.isVisible()) {
+          await infoIcon.click();
+          await page.waitForTimeout(1500);
+        }
+        
+        const memberTab = page.locator('[data-id="div_Group_Members"]').or(page.getByText(/Danh sách thành viên/i)).or(page.getByText(/Thành viên \(\d+\)/i)).or(page.getByText(/^Thành viên$/i)).first();
+        await memberTab.click({ timeout: 5000 });
+        await page.waitForTimeout(2000);
+      }
+    } catch (e) {
+      console.log('[Playwright Worker] Lỗi: Không tìm thấy tab Thành viên:', e.message);
+      await page.screenshot({ path: 'zalo-error-send-member-tab.png' });
+      throw new Error(`Không thể mở danh sách thành viên của nhóm ${groupName}.`);
+    }
+
+    // 4. Tìm thành viên trong ô tìm kiếm của nhóm
+    const searchInputs = await page.locator('input[placeholder*="Tìm thành viên" i], .group-board-members input, [data-id="div_Group_Members"] input').all();
+    let targetInput = searchInputs[0];
+    
+    if (!targetInput) {
+      const allInputs = await page.locator('input[type="text"]').all();
+      // Ô search thứ 2 thường là ô search trong nhóm
+      targetInput = allInputs[1] || allInputs[0];
+    }
+    
+    if (targetInput) {
+      await targetInput.click();
+      await targetInput.fill('');
+      await targetInput.pressSequentially(memberName, { delay: 150 });
+      await page.waitForTimeout(1500);
+    } else {
+      throw new Error('Không tìm thấy ô tìm kiếm thành viên trong nhóm.');
+    }
+
+    // 5. Click vào avatar / tên của thành viên đó để mở Profile
+    try {
+       const memberEls = await page.locator('.ReactVirtualized__Grid .name, .group-board-members .name, [data-id="div_Item_Name"], .member-name').all();
+       let found = false;
+       for (const el of memberEls) {
+         const nameText = await el.innerText();
+         if (nameText && nameText.trim() === memberName) {
+           await el.click(); // Mở Profile
+           found = true;
+           break;
+         }
+       }
+       if (!found) throw new Error(`Không tìm thấy người dùng "${memberName}" trong danh sách sau khi lọc.`);
+    } catch (e) {
+       throw new Error(`Lỗi click chọn thành viên: ${e.message}`);
+    }
+
+    await page.waitForTimeout(1500);
+
+    // 6. Bấm nút "Nhắn tin" trong cửa sổ Profile
+    try {
+      const messageBtn = page.locator('button:has-text("Nhắn tin"), [title*="Nhắn tin"], [icon="icn-Message"]').first();
+      await messageBtn.click();
+      await page.waitForTimeout(2000);
+    } catch (e) {
+      throw new Error('Không tìm thấy nút Nhắn tin trong Profile. Có thể người này chặn tin nhắn lạ hoặc Zalo đổi giao diện.');
+    }
+
+    // 7. Gửi nội dung tin nhắn
+    // Xử lý Spintax
+    let finalMessage = messageTemplate.replace(/\{([^{}]*\|[^{}]*)\}/g, (match, p1) => {
+      const options = p1.split('|');
+      return options[Math.floor(Math.random() * options.length)];
+    });
+
+    const nameParts = memberName.split(' ');
+    const firstName = nameParts[nameParts.length - 1] || '';
+    const lastName = nameParts[0] || '';
+
+    const now = new Date();
+    const dateStr = now.toLocaleDateString('vi-VN');
+    const timeStr = now.toLocaleTimeString('vi-VN');
+    const yearStr = now.getFullYear().toString();
+    const randomStr = Math.floor(100000 + Math.random() * 900000).toString();
+
+    finalMessage = finalMessage
+      .replace(/{name}/g, memberName)
+      .replace(/{first_name}/g, firstName)
+      .replace(/{last_name}/g, lastName)
+      .replace(/{date}/g, dateStr)
+      .replace(/{datetime}/g, `${timeStr} ${dateStr}`)
+      .replace(/{year}/g, yearStr)
+      .replace(/{random}/g, randomStr);
+
+    // Gửi ảnh
+    if (imagePath && fs.existsSync(imagePath)) {
+      const modifiedImagePath = imagePath.replace(/(\.[\w\d_-]+)$/i, '_hashed$1');
+      await randomizeImageHash(imagePath, modifiedImagePath);
+      try {
+        await page.setInputFiles('input[type="file"][accept*="image"]', modifiedImagePath, { timeout: 5000 });
+        await page.waitForTimeout(2500);
+      } catch (err) {
+        try {
+          const [fileChooser] = await Promise.all([
+            page.waitForEvent('filechooser', { timeout: 10000 }),
+            page.locator('[icon="OutlineImage"], [icon="Photo"], .chat-box-photo-btn, [title*="hình ảnh" i]').first().click({ timeout: 5000 })
+          ]);
+          await fileChooser.setFiles(modifiedImagePath);
+          await page.waitForTimeout(2500);
+        } catch (err2) { }
+      }
+      setTimeout(() => deleteTempImage(modifiedImagePath), 30000);
+    }
+
+    // Gõ nội dung
+    console.log(`[Playwright Worker] Gõ nội dung tin nhắn: "${finalMessage}"`);
+    const chatInputSelector = '#chatInput, #richInput, [data-id="div_Main_Input_Container"] [contenteditable="true"]';
+    await page.locator(chatInputSelector).first().click();
+    await page.locator(chatInputSelector).first().pressSequentially(finalMessage, { delay: 80 });
+
+    // Enter
+    console.log(`[Playwright Worker] Bấm Gửi (Enter)...`);
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(2500);
+
+    const isBlocked = await page.evaluate(() => {
+      const messages = Array.from(document.querySelectorAll('.chat-message, .message-view, .system-message, .chat-content, .error-msg'));
+      const lastFewMessages = messages.slice(-5);
+      for (const msg of lastFewMessages) {
+        const text = msg.innerText?.toLowerCase() || '';
+        if (text.includes('không nhận tin nhắn từ người lạ') || text.includes('đã chặn bạn') || text.includes('chỉ nhận tin nhắn từ bạn bè')) {
+          return true;
+        }
+        if (msg.querySelector('.icn-error, .icon-error, [icon="outline-warning-circle"]')) {
+          return true;
+        }
+      }
+      return false;
+    });
+
+    if (isBlocked) throw new Error('Bị chặn: Người dùng không nhận tin nhắn từ người lạ.');
+
+    console.log(`[Playwright Worker] Hoàn thành gửi tin Group Member: ${memberName}`);
+
+  } catch (error) {
+    console.error(`[Playwright Worker] Lỗi khi gửi tin cho TV nhóm ${memberName}:`, error);
+    throw error;
+  }
+};
+
 
 
 // Hàm quét và đồng bộ danh bạ
@@ -562,6 +746,201 @@ export const syncZaloGroups = async (accountId = 'default') => {
     return true;
   } catch (error) {
     console.error('[Playwright Worker] Lỗi đồng bộ nhóm:', error);
+    throw error;
+  }
+};
+
+export const syncGroupMembers = async (accountId, groupId, groupName) => {
+  try {
+    const context = await initBrowser(accountId);
+    const page = context.pages().find(p => p.url().includes('chat.zalo.me'));
+    if (!page) throw new Error('Không tìm thấy trang chat.zalo.me');
+
+    console.log(`[Playwright Worker] Bắt đầu quét thành viên nhóm: ${groupName}`);
+
+    // Đóng popup
+    try {
+      const closeBtn = page.locator('.modal-close, [icon*="lose" i], [icon*="close" i], button[title*="Đóng" i]').first();
+      if (await closeBtn.isVisible({ timeout: 2000 })) {
+        await closeBtn.click();
+        await page.waitForTimeout(1000);
+      }
+    } catch (e) { }
+
+    // Tìm nhóm
+    const searchSelector = '#contact-search-input, #global-search-input, [data-translate-placeholder="STR_SEARCH_CONTACT"], [placeholder*="Tìm kiếm" i]';
+    await page.locator(searchSelector).first().click();
+    await page.locator(searchSelector).first().fill('');
+    await page.locator(searchSelector).first().pressSequentially(groupName, { delay: 150 });
+    
+    // Đợi kết quả
+    await page.waitForTimeout(1500);
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(2000);
+
+    // Mở bảng danh sách thành viên
+    try {
+      // BƯỚC 1: Mở Bảng thông tin (Info Panel) bằng mọi giá
+      const infoIcon = page.locator('[title*="Thông tin hội thoại" i], [title*="Thông tin nhóm" i], [icon*="Window-Right" i], .header-btn[title*="Thông tin"]').first();
+      // Nếu chưa có bảng thông tin, bấm mở
+      if (!(await page.locator('[data-id="div_Right_Sidebar"], .zalo-sidebar-right, .info-board').first().isVisible({ timeout: 2000 }))) {
+        await infoIcon.click();
+        await page.waitForTimeout(1500);
+      }
+
+      // BƯỚC 2: Kiểm tra xem đã ở trong màn hình "Danh sách thành viên" chưa
+      const isAlreadyInMembers = await page.getByText('Danh sách thành viên').first().isVisible({ timeout: 1000 }) || 
+                                 await page.getByText('Thêm thành viên').first().isVisible({ timeout: 1000 });
+                                 
+      if (!isAlreadyInMembers) {
+        // BƯỚC 3: Tìm và bấm vào dòng "Thành viên" trong Info Panel
+        // Zalo thường bọc icon và text trong 1 div clickable
+        const memberTab = page.locator('[icon*="member" i], [icon*="Member" i]').first().locator('xpath=./ancestor::div[contains(@class, "clickable") or contains(@class, "menu-item") or @role="button"]').first();
+        
+        if (await memberTab.isVisible()) {
+          await memberTab.click();
+        } else {
+          // Fallback: Tìm bằng text mềm dẻo hơn
+          const textTab = page.locator('div').filter({ hasText: /Thành viên/i }).filter({ hasText: /\d+/ }).last();
+          await textTab.click();
+        }
+        await page.waitForTimeout(2000);
+
+        // Xác minh lại đã vào đúng màn hình Thành viên chưa (Dựa vào ảnh screenshot mới)
+        const isSuccess = await page.getByText('Danh sách thành viên').first().isVisible({ timeout: 1000 }) || 
+                          await page.getByText('Thêm thành viên').first().isVisible({ timeout: 1000 }) ||
+                          await page.locator('input[placeholder*="Tìm kiếm thành viên" i]').first().isVisible({ timeout: 1000 }) ||
+                          await page.getByText('Tìm kiếm thành viên').first().isVisible({ timeout: 1000 }) ||
+                          await page.locator('[icon="icn-back"]').first().isVisible({ timeout: 1000 }); // Nút Back (< Thành viên)
+
+        if (!isSuccess) throw new Error('Click tab Thành viên thành công nhưng Zalo không chuyển trang (Không tìm thấy giao diện thành viên).');
+      }
+    } catch (e) {
+      console.log('[Playwright Worker] Lỗi: Không thể mở danh sách thành viên:', e.message);
+      await page.screenshot({ path: 'zalo-error-member-tab.png' });
+      throw new Error('Không thể mở danh sách thành viên. Vui lòng xem ảnh zalo-error-member-tab.png');
+    }
+
+    console.log('[Playwright Worker] Bắt đầu cuộn vét cạn thành viên...');
+    const rawMembers = await (async () => {
+      let membersMap = new Map();
+      let unchangedScrolls = 0;
+      let lastCount = 0;
+
+      // Tìm tọa độ vùng chứa thành viên (thường nằm ở Panel thông tin nhóm bên phải)
+      const boundingBox = await page.evaluate(() => {
+        const grids = Array.from(document.querySelectorAll('.ReactVirtualized__Grid, [data-id="div_Group_Members"], .group-board-members, .member-list'));
+        let maxArea = 0;
+        let target = null;
+        for (const grid of grids) {
+          const rect = grid.getBoundingClientRect();
+          // CHỈ LẤY CÁC GRID NẰM BÊN PHẢI (rect.left > 500) ĐỂ TRÁNH QUÉT NHẦM DANH SÁCH CHAT BÊN TRÁI
+          if (rect.left > 500 && rect.width * rect.height > maxArea) {
+            maxArea = rect.width * rect.height;
+            target = rect;
+          }
+        }
+        return target ? { x: target.left + target.width / 2, y: target.top + target.height / 2 } : null;
+      });
+
+      if (boundingBox) {
+         await page.mouse.move(boundingBox.x, boundingBox.y);
+      } else {
+         await page.mouse.move(900, 400); // Tọa độ tương đối cho cột phải
+      }
+
+      while (unchangedScrolls < 5 && membersMap.size < 5000) {
+        const visibleMembers = await page.evaluate(() => {
+          const results = [];
+          const grids = Array.from(document.querySelectorAll('.ReactVirtualized__Grid, [data-id="div_Group_Members"], .group-board-members, .member-list'));
+          let mainContainer = null;
+          let maxArea = 0;
+          for (const grid of grids) {
+            const rect = grid.getBoundingClientRect();
+            // CHỈ LẤY CÁC GRID NẰM BÊN PHẢI (rect.left > 500)
+            if (rect.left > 500 && rect.width * rect.height > maxArea) {
+              maxArea = rect.width * rect.height;
+              mainContainer = grid;
+            }
+          }
+          
+          if (!mainContainer) {
+            mainContainer = document.querySelector('[data-id="div_Right_Sidebar"], .zalo-sidebar-right, .info-board, .group-board');
+          }
+          
+          if (!mainContainer) return results;
+
+          // THUẬT TOÁN MỚI: BÓC TÁCH TOÀN BỘ LEAF TEXT NODES (Không phụ thuộc vào class .name hay .truncate)
+          // Vì chúng ta chắc chắn đang ở màn hình Thành Viên, mọi text hiển thị trên cột phải nếu không phải là các nút UI (Kết bạn, Trưởng nhóm...) thì CHẮC CHẮN là tên thành viên!
+          const allElements = mainContainer.querySelectorAll('*');
+          const ignoreList = [
+            'Thành viên', 'Tìm kiếm thành viên', 'Trưởng nhóm', 'Phó nhóm', 'Kết bạn', 
+            'Bạn', 'Trở lại', 'Đóng', 'Đã tham gia', 'Đã gửi lời mời', 'Tìm kiếm', 
+            'Danh sách thành viên', 'Thêm thành viên', 'Bỏ qua', 'Xác nhận',
+            'Hủy', 'Lưu', 'Chặn', 'Báo xấu', 'Rời nhóm', 'Mời vào nhóm', 'Mời',
+            'Thêm', 'Tất cả', 'Quản lý nhóm', 'Cài đặt nhóm', 'Link tham gia nhóm', 'Người tạo nhóm',
+            'Tin nhắn', 'Gọi điện', 'Gọi video', 'Xem trang cá nhân', 'Chỉ định làm nhóm phó', 'Mời ra khỏi nhóm'
+          ];
+
+          allElements.forEach(el => {
+            // Chỉ lấy các thẻ chứa text trực tiếp (không chứa thẻ con dạng khối)
+            if (el.childElementCount === 0 || (el.childElementCount === 1 && el.children[0].tagName === 'SPAN')) {
+              let text = el.innerText ? el.innerText.trim().split('\n')[0] : '';
+              if (!text || text.length < 2) return;
+              
+              // Lọc bỏ các text UI của Zalo
+              if (ignoreList.includes(text) || text.match(/Danh sách thành viên/i) || text.match(/^Thành viên/i) || text.match(/thành viên/i)) {
+                return;
+              }
+              
+              results.push({ name: text, zaloId: `zalo_id_mem_${text}`, avatar: '' });
+            }
+          });
+          return results;
+        });
+
+        visibleMembers.forEach(m => {
+          if (!membersMap.has(m.name)) membersMap.set(m.name, m);
+        });
+
+        if (membersMap.size === lastCount) {
+          unchangedScrolls++;
+        } else {
+          unchangedScrolls = 0;
+          lastCount = membersMap.size;
+        }
+
+        if (unchangedScrolls < 5) {
+           await page.mouse.wheel(0, Math.floor(Math.random() * 400) + 400);
+           await page.waitForTimeout(Math.floor(Math.random() * 400) + 800);
+        }
+      }
+      return Array.from(membersMap.values());
+    })();
+
+    console.log(`[Playwright Worker] Vét cạn thành công! Đã quét được ${rawMembers.length} thành viên.`);
+
+    if (rawMembers.length > 0) {
+      await GroupMember.deleteMany({ accountId, groupId });
+
+      const membersToSave = rawMembers.map(m => ({
+        accountId,
+        groupId,
+        zaloId: m.zaloId,
+        name: m.name,
+        avatar: m.avatar
+      }));
+
+      console.log(`\n[Playwright Worker] ===== DỮ LIỆU THÀNH VIÊN NHÓM QUÉT ĐƯỢC TRƯỚC KHI LƯU =====\n`, JSON.stringify(membersToSave, null, 2), `\n==================================================================\n`);
+      await GroupMember.insertMany(membersToSave);
+      console.log(`[Playwright Worker] Đã lưu ${membersToSave.length} thành viên vào DB.`);
+    } else {
+      console.log(`[Playwright Worker] Không quét được thành viên nào.`);
+    }
+
+    return true;
+  } catch (error) {
+    console.error('[Playwright Worker] Lỗi đồng bộ thành viên nhóm:', error);
     throw error;
   }
 };
