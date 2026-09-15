@@ -170,10 +170,11 @@ export const sendMessageToZalo = async (accountId = 'default', to, messageTempla
     });
 
     // 5. Xử lý Shortcodes cá nhân hóa
-    let actualName = to; // Mặc định là chuỗi tìm kiếm
+    let actualName = recipientName || to; // Ưu tiên dùng Tên từ Excel, hoặc chuỗi tìm kiếm
     try {
-      // Thử lấy tên thật trên Header của cửa sổ chat
-      actualName = await page.innerText('.header-title');
+      // Thử lấy tên thật trên Header của cửa sổ chat (Tên hiển thị thật sự trên Zalo)
+      const headerName = await page.innerText('.header-title', { timeout: 2000 });
+      if (headerName) actualName = headerName;
     } catch (e) { }
 
     const nameParts = actualName.split(' ');

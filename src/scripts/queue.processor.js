@@ -1,6 +1,8 @@
 import { Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
 import { sendMessageToZalo, syncZaloContacts, closeAllBrowsers, sendGroupMemberMessageToZalo } from './playwright.worker.js';
 import { sendMessageViaApi, closeAllZaloApis } from './zalo-api.worker.js';
 import { Campaign } from '../models/Campaign.js';
@@ -28,7 +30,7 @@ const worker = new Worker('ZaloMessages', async (job) => {
   }
 
   if (job.name === 'sendCampaignMessage') {
-    const { campaignId, accountId, contactId, to, message, imagePath, groupName } = job.data;
+    const { campaignId, accountId, contactId, to, message, imagePath, groupName, recipientName } = job.data;
     
     const delay = Math.floor(Math.random() * (45000 - 20000 + 1) + 20000);
     console.log(`[Queue Processor] Tạm nghỉ ${delay/1000}s trước khi gửi cho ${to} (Chiến dịch)...`);
@@ -40,7 +42,7 @@ const worker = new Worker('ZaloMessages', async (job) => {
         await sendGroupMemberMessageToZalo(accountId || 'default', groupName, to, message, imagePath);
       } else {
         console.log(`[Queue Processor] Gọi luồng gửi tin Danh Bạ thông thường...`);
-        await sendMessageToZalo(accountId || 'default', to, message, imagePath);
+        await sendMessageToZalo(accountId || 'default', to, message, imagePath, recipientName);
       }
       console.log(`[Queue Processor] Đã gửi xong Job ${job.id} (Chiến dịch)`);
       
@@ -125,9 +127,42 @@ worker.on('failed', (job, err) => {
   console.error(`[Queue Processor] Job ${job.id} bị lỗi: ${err.message}`);
 });
 
-// TỰ ĐỘNG TẮT TRÌNH DUYỆT KHI HẾT VIỆC (Tránh lỗi đá ping-pong session)
+import { Queue } from 'bullmq';
+const queue = new Queue('ZaloMessages', { connection });
+
+// TỰ ĐỘNG TẮT TRÌNH DUYỆT VÀ DỌN RÁC KHI HẾT VIỆC
 worker.on('drained', async () => {
   console.log('[Queue Processor] Hàng đợi đã trống. Đang đóng tất cả trình duyệt và API ngầm để giải phóng tài nguyên...');
   await closeAllBrowsers();
   await closeAllZaloApis();
+
+  try {
+    // Lấy danh sách các jobs đang chờ hoặc đang chạy (đề phòng)
+    const waiting = await queue.getWaiting();
+    const active = await queue.getActive();
+    const delayed = await queue.getDelayed();
+    const allJobs = [...waiting, ...active, ...delayed];
+    
+    const activeImagePaths = allJobs.map(j => j.data?.imagePath).filter(Boolean);
+    
+    // Quét thư mục uploads
+    const uploadsDir = path.resolve('uploads');
+    if (fs.existsSync(uploadsDir)) {
+      const files = fs.readdirSync(uploadsDir);
+      let deletedCount = 0;
+      for (const file of files) {
+        const fullPath = path.join(uploadsDir, file);
+        // Nếu file ảnh không còn nằm trong bất kỳ job nào đang chờ/chạy -> Xóa
+        if (!activeImagePaths.includes(fullPath)) {
+          fs.unlinkSync(fullPath);
+          deletedCount++;
+        }
+      }
+      if (deletedCount > 0) {
+        console.log(`[Queue Processor] Đã dọn dẹp tự động ${deletedCount} file ảnh rác trong thư mục uploads.`);
+      }
+    }
+  } catch (err) {
+    console.error(`[Queue Processor] Lỗi khi dọn dẹp file uploads:`, err.message);
+  }
 });

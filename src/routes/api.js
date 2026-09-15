@@ -135,51 +135,80 @@ router.get('/accounts/status/:id', async (req, res) => {
 // API: Create and Start a Campaign
 router.post('/campaigns', upload.single('image'), async (req, res) => {
   try {
-    let { accountId, name, messageTemplate, recipients, groupName } = req.body;
+    let { accountId, accountIds, limitPerAccount, name, messageTemplate, recipients, groupName } = req.body;
+
+    let targetAccountIds = [];
+    if (accountIds) {
+      targetAccountIds = JSON.parse(accountIds);
+    } else if (accountId) {
+      targetAccountIds = [accountId];
+    }
+
+    const limit = limitPerAccount ? parseInt(limitPerAccount, 10) : 999999;
 
     // Parse recipients if it's sent as a JSON string from FormData
     if (typeof recipients === 'string') {
       recipients = JSON.parse(recipients);
     }
 
-    if (!accountId || !messageTemplate || !recipients || recipients.length === 0) {
+    if (targetAccountIds.length === 0 || !messageTemplate || !recipients || recipients.length === 0) {
       return res.status(400).json({ error: 'Thiếu thông tin bắt buộc' });
     }
 
     // Lấy đường dẫn file ảnh nếu có
     const imagePath = req.file ? req.file.path : null;
 
-    // Prepare recipients for DB
-    const dbRecipients = recipients.map(c => ({
-      contactId: c.id,
-      status: 'pending'
-    }));
+    let currentIndex = 0;
+    const campaignIds = [];
+    const processedContactIds = [];
 
-    // Create Campaign
-    const campaign = new Campaign({
-      accountId,
-      name: name || `Chiến dịch ${new Date().toLocaleString('vi-VN')}`,
-      messageTemplate,
-      recipients: dbRecipients,
-      status: 'running'
-    });
-    await campaign.save();
+    for (const accId of targetAccountIds) {
+      if (currentIndex >= recipients.length) break;
+      const chunk = recipients.slice(currentIndex, currentIndex + limit);
+      if (chunk.length === 0) continue;
+      
+      const dbRecipients = chunk.map(c => ({
+        contactId: c.id,
+        status: 'pending'
+      }));
 
-    // Dispatch jobs to Queue
-    for (const recipient of recipients) {
-      await zaloMessageQueue.add('sendCampaignMessage', {
-        campaignId: campaign._id,
-        accountId,
-        contactId: recipient.id,
-        to: recipient.name,
-        message: messageTemplate,
-        imagePath: imagePath, // Truyền đường dẫn ảnh cho worker
-        groupName: groupName, // Truyền groupName nếu có (dành cho thành viên nhóm)
-        timestamp: Date.now()
+      const campaignName = targetAccountIds.length > 1 ? `${name || 'Chiến dịch'} - ${accId}` : (name || `Chiến dịch ${new Date().toLocaleString('vi-VN')}`);
+      
+      const campaign = new Campaign({
+        accountId: accId,
+        name: campaignName,
+        messageTemplate,
+        recipients: dbRecipients,
+        status: 'running'
       });
+      await campaign.save();
+      campaignIds.push(campaign._id);
+      processedContactIds.push(...chunk.map(c => c.id));
+
+      // Dispatch jobs to Queue
+      for (const recipient of chunk) {
+        await zaloMessageQueue.add('sendCampaignMessage', {
+          campaignId: campaign._id,
+          accountId: accId,
+          contactId: recipient.id,
+          to: recipient.id, // MUST search by phone number!
+          recipientName: recipient.name, // Giữ lại tên thật để dùng cá nhân hóa {name}
+          message: messageTemplate,
+          imagePath: imagePath,
+          groupName: groupName,
+          timestamp: Date.now()
+        });
+      }
+      
+      currentIndex += limit;
     }
 
-    res.json({ success: true, message: `Đã bắt đầu chiến dịch gửi tới ${recipients.length} người.`, campaignId: campaign._id });
+    res.json({ 
+      success: true, 
+      message: `Đã bắt đầu ${campaignIds.length} chiến dịch gửi tới ${processedContactIds.length} người.`, 
+      campaignIds,
+      processedContactIds
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -400,7 +429,20 @@ router.get('/campaigns/:id', async (req, res) => {
   try {
     const campaign = await Campaign.findById(req.params.id);
     if (!campaign) return res.status(404).json({ success: false, error: 'Không tìm thấy chiến dịch' });
-    res.json({ success: true, data: campaign });
+    
+    const total = campaign.recipients.length;
+    const sent = campaign.recipients.filter(r => r.status === 'sent').length;
+    const failed = campaign.recipients.filter(r => r.status === 'failed').length;
+    const pending = campaign.recipients.filter(r => r.status === 'pending').length;
+
+    const data = campaign.toObject();
+    data.stats = { total, sent, failed, pending };
+    
+    if (data.status === 'running' && pending === 0) {
+      data.status = 'completed';
+    }
+
+    res.json({ success: true, data: data });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -509,54 +551,78 @@ router.post('/accounts/sync-group-members-v2', async (req, res) => {
 // API: Tạo chiến dịch gửi tin bằng UID qua zca-js (V2)
 router.post('/campaigns-v2', upload.single('image'), async (req, res) => {
   try {
-    let { accountId, name, messageTemplate, recipients, groupName } = req.body;
+    let { accountId, accountIds, limitPerAccount, name, messageTemplate, recipients, groupName } = req.body;
+
+    let targetAccountIds = [];
+    if (accountIds) {
+      targetAccountIds = JSON.parse(accountIds);
+    } else if (accountId) {
+      targetAccountIds = [accountId];
+    }
+
+    const limit = limitPerAccount ? parseInt(limitPerAccount, 10) : 999999;
 
     // Parse recipients if it's sent as a JSON string from FormData
     if (typeof recipients === 'string') {
       recipients = JSON.parse(recipients);
     }
 
-    if (!accountId || !messageTemplate || !recipients || recipients.length === 0) {
+    if (targetAccountIds.length === 0 || !messageTemplate || !recipients || recipients.length === 0) {
       return res.status(400).json({ error: 'Thiếu thông tin bắt buộc' });
     }
 
     // Lấy đường dẫn file ảnh nếu có
     const imagePath = req.file ? req.file.path : null;
 
-    // Prepare recipients for DB
-    const dbRecipients = recipients.map(c => ({
-      contactId: c.id,
-      status: 'pending'
-    }));
+    let currentIndex = 0;
+    const campaignIds = [];
+    const processedContactIds = [];
 
-    // Create Campaign
-    const campaign = new Campaign({
-      accountId,
-      name: name || `Chiến dịch API ${new Date().toLocaleString('vi-VN')}`,
-      messageTemplate,
-      recipients: dbRecipients,
-      status: 'running'
-    });
-    await campaign.save();
+    for (const accId of targetAccountIds) {
+      if (currentIndex >= recipients.length) break;
+      const chunk = recipients.slice(currentIndex, currentIndex + limit);
+      if (chunk.length === 0) continue;
+      
+      const dbRecipients = chunk.map(c => ({
+        contactId: c.id,
+        status: 'pending'
+      }));
 
-    // Dispatch jobs to Queue (dùng job name mới: sendCampaignMessageV2)
-    for (const recipient of recipients) {
-      await zaloMessageQueue.add('sendCampaignMessageV2', {
-        campaignId: campaign._id,
-        accountId,
-        contactId: recipient.id,
-        recipientUid: recipient.id, // UID thật — chính xác 100%
-        recipientName: recipient.name,
-        message: messageTemplate,
-        imagePath: imagePath,
-        timestamp: Date.now()
+      const campaignName = targetAccountIds.length > 1 ? `${name || 'Chiến dịch API'} - ${accId}` : (name || `Chiến dịch API ${new Date().toLocaleString('vi-VN')}`);
+      
+      const campaign = new Campaign({
+        accountId: accId,
+        name: campaignName,
+        messageTemplate,
+        recipients: dbRecipients,
+        status: 'running'
       });
+      await campaign.save();
+      campaignIds.push(campaign._id);
+      processedContactIds.push(...chunk.map(c => c.id));
+
+      // Dispatch jobs to Queue
+      for (const recipient of chunk) {
+        await zaloMessageQueue.add('sendCampaignMessageV2', {
+          campaignId: campaign._id,
+          accountId: accId,
+          contactId: recipient.id,
+          recipientUid: recipient.id,
+          recipientName: recipient.name,
+          message: messageTemplate,
+          imagePath: imagePath,
+          timestamp: Date.now()
+        });
+      }
+      
+      currentIndex += limit;
     }
 
     res.json({
       success: true,
-      message: `Đã bắt đầu chiến dịch API gửi tới ${recipients.length} người (bằng UID).`,
-      campaignId: campaign._id
+      message: `Đã bắt đầu ${campaignIds.length} chiến dịch API gửi tới ${processedContactIds.length} người.`,
+      campaignIds,
+      processedContactIds
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
