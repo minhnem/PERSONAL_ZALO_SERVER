@@ -224,6 +224,27 @@ export const syncFriendsViaApi = async (accountId) => {
   try {
     const friends = await api.getAllFriends();
 
+    // 1. Fetch tags (labels) and map to UIDs
+    let uidToTags = {};
+    try {
+      if (typeof api.getLabels === 'function') {
+        const labelsRes = await api.getLabels();
+        const labels = labelsRes?.labelData || [];
+        labels.forEach(label => {
+          const tagName = label.text || label.textKey;
+          if (tagName && label.conversations && Array.isArray(label.conversations)) {
+            label.conversations.forEach(uid => {
+              if (!uidToTags[uid]) uidToTags[uid] = [];
+              uidToTags[uid].push(tagName);
+            });
+          }
+        });
+        console.log(`[ZCA Worker] Đã bóc tách thành công Tag cho các UID. Tín hiệu mẫu: ${Object.keys(uidToTags).length} UIDs có tag.`);
+      }
+    } catch (err) {
+      console.error('[ZCA Worker] Lỗi khi lấy danh sách Tag:', err.message);
+    }
+
     console.log(`[ZCA Worker] API trả về ${friends.length} bạn bè.`);
 
     if (friends.length > 0) {
@@ -234,6 +255,7 @@ export const syncFriendsViaApi = async (accountId) => {
         avatar: f.avatar || '',
         phoneNumber: f.phoneNumber || '',
         type: 'friend',
+        tags: uidToTags[f.userId] || [],
       }));
 
       console.log(`\n[ZCA Worker] ===== DỮ LIỆU BẠN BÈ QUÉT ĐƯỢC (MẪU 5 ĐẦU) =====`);
