@@ -22,6 +22,7 @@ const campaignSchema = new mongoose.Schema({
     contactId: {
       type: String
     },
+    name: String,
     status: {
       type: String,
       enum: ['pending', 'sent', 'failed'],

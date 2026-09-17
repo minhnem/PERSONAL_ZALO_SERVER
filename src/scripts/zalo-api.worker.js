@@ -434,8 +434,9 @@ export const syncGroupMembersViaApi = async (accountId, groupId) => {
  * @param {string} recipientUid - UID người nhận (chính xác 100%)
  * @param {string} messageText - Nội dung tin nhắn (đã xử lý spintax)
  * @param {string|null} imagePath - Đường dẫn ảnh đính kèm (nếu có)
+ * @param {boolean} isGroupTarget - Có phải nhóm đích hay không
  */
-export const sendMessageViaApi = async (accountId, recipientUid, messageText, imagePath = null) => {
+export const sendMessageViaApi = async (accountId, recipientUid, messageText, imagePath = null, isGroupTarget = false) => {
   const api = getApi(accountId);
 
   console.log(`[ZCA Worker] Đang gửi tin nhắn cho UID: ${recipientUid}...`);
@@ -489,7 +490,7 @@ export const sendMessageViaApi = async (accountId, recipientUid, messageText, im
     const result = await api.sendMessage(
       messageContent,
       recipientUid,
-      ThreadType.User
+      isGroupTarget ? ThreadType.Group : ThreadType.User
     );
 
     console.log(`[ZCA Worker] ✅ Gửi tin thành công cho UID ${recipientUid}. MsgId: ${result?.message?.msgId || 'N/A'}`);
@@ -497,6 +498,58 @@ export const sendMessageViaApi = async (accountId, recipientUid, messageText, im
     return { success: true, msgId: result?.message?.msgId };
   } catch (error) {
     console.error(`[ZCA Worker] ❌ Lỗi gửi tin cho UID ${recipientUid}:`, error.message);
+    throw error;
+  }
+};
+
+/**
+ * Gửi lời mời kết bạn bằng UID (zca-js V2)
+ */
+export const sendFriendRequestViaApi = async (accountId, recipientUid, message) => {
+  try {
+    const api = getApi(accountId);
+
+    // Xử lý Shortcodes cá nhân hóa
+    let recipientName = 'bạn';
+    try {
+      const contact = await Contact.findOne({ zaloId: recipientUid });
+      const member = await GroupMember.findOne({ zaloId: recipientUid });
+      recipientName = contact?.name || member?.name || 'bạn';
+    } catch (e) { /* ignore */ }
+
+    const nameParts = recipientName.split(' ');
+    const firstName = nameParts[nameParts.length - 1] || '';
+    const lastName = nameParts[0] || '';
+
+    const now = new Date();
+    const dateStr = now.toLocaleDateString('vi-VN');
+    const timeStr = now.toLocaleTimeString('vi-VN');
+    const yearStr = now.getFullYear().toString();
+    const randomStr = Math.floor(100000 + Math.random() * 900000).toString();
+
+    let finalMessage = message || '';
+    finalMessage = finalMessage
+      .replace(/{name}/g, recipientName)
+      .replace(/{first_name}/g, firstName)
+      .replace(/{last_name}/g, lastName)
+      .replace(/{date}/g, dateStr)
+      .replace(/{datetime}/g, `${timeStr} ${dateStr}`)
+      .replace(/{year}/g, yearStr)
+      .replace(/{random}/g, randomStr);
+      
+    // Đảm bảo không vượt quá ~150 ký tự
+    if (finalMessage.length > 150) {
+      finalMessage = finalMessage.substring(0, 150);
+      console.warn(`[ZCA Worker] Lời mời kết bạn quá dài, đã cắt bớt: ${finalMessage}`);
+    }
+
+    const result = await api.sendFriendRequest(finalMessage, recipientUid);
+
+    console.log(`[ZCA Worker] ✅ Gửi yêu cầu kết bạn thành công cho UID ${recipientUid}`);
+    return { success: true, result };
+  } catch (error) {
+    console.error(`[ZCA Worker] ❌ Lỗi gửi kết bạn cho UID ${recipientUid}:`, error.message);
+    // Có thể là lỗi do đã là bạn bè, hoặc bị chặn, ...
     throw error;
   }
 };

@@ -169,6 +169,7 @@ router.post('/campaigns', upload.single('image'), async (req, res) => {
       
       const dbRecipients = chunk.map(c => ({
         contactId: c.id,
+        name: c.name,
         status: 'pending'
       }));
 
@@ -551,7 +552,7 @@ router.post('/accounts/sync-group-members-v2', async (req, res) => {
 // API: Tạo chiến dịch gửi tin bằng UID qua zca-js (V2)
 router.post('/campaigns-v2', upload.single('image'), async (req, res) => {
   try {
-    let { accountId, accountIds, limitPerAccount, name, messageTemplate, recipients, groupName } = req.body;
+    let { accountId, accountIds, limitPerAccount, name, messageTemplate, recipients, groupName, isFriendRequest, friendRequestMessage, isGroupTarget } = req.body;
 
     let targetAccountIds = [];
     if (accountIds) {
@@ -585,6 +586,7 @@ router.post('/campaigns-v2', upload.single('image'), async (req, res) => {
       
       const dbRecipients = chunk.map(c => ({
         contactId: c.id,
+        name: c.name,
         status: 'pending'
       }));
 
@@ -611,6 +613,9 @@ router.post('/campaigns-v2', upload.single('image'), async (req, res) => {
           recipientName: recipient.name,
           message: messageTemplate,
           imagePath: imagePath,
+          isFriendRequest: isFriendRequest === 'true' || isFriendRequest === true,
+          friendRequestMessage: friendRequestMessage,
+          isGroupTarget: isGroupTarget === 'true',
           timestamp: Date.now()
         });
       }

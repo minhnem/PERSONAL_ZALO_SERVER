@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import { sendMessageToZalo, syncZaloContacts, closeAllBrowsers, sendGroupMemberMessageToZalo } from './playwright.worker.js';
-import { sendMessageViaApi, closeAllZaloApis } from './zalo-api.worker.js';
+import { sendMessageViaApi, sendFriendRequestViaApi, closeAllZaloApis } from './zalo-api.worker.js';
 import { Campaign } from '../models/Campaign.js';
 
 dotenv.config();
@@ -80,15 +80,28 @@ const worker = new Worker('ZaloMessages', async (job) => {
 
   // ====== JOB MỚI: Gửi tin bằng zca-js API (UID trực tiếp, không cần browser) ======
   if (job.name === 'sendCampaignMessageV2') {
-    const { campaignId, accountId, contactId, recipientUid, recipientName, message, imagePath } = job.data;
+    const { campaignId, accountId, contactId, recipientUid, recipientName, message, imagePath, isFriendRequest, friendRequestMessage, isGroupTarget } = job.data;
     
     const delay = Math.floor(Math.random() * (45000 - 20000 + 1) + 20000);
-    console.log(`[Queue Processor] [API] Tạm nghỉ ${delay/1000}s trước khi gửi cho UID ${recipientUid} (${recipientName})...`);
+    console.log(`[Queue Processor] [API] Tạm nghỉ ${delay/1000}s trước khi xử lý Job cho UID ${recipientUid} (${recipientName})...`);
     await new Promise(resolve => setTimeout(resolve, delay));
     
     try {
-      await sendMessageViaApi(accountId || 'default', recipientUid, message, imagePath);
-      console.log(`[Queue Processor] [API] Đã gửi xong Job ${job.id} cho UID ${recipientUid}`);
+      if (isFriendRequest) {
+        // Lệnh gửi kết bạn (Bọc try-catch để nếu lỗi do "đã là bạn bè" thì vẫn gửi tin nhắn thường)
+        try {
+          await sendFriendRequestViaApi(accountId || 'default', recipientUid, friendRequestMessage);
+          console.log(`[Queue Processor] [API] Đã gửi kết bạn cho UID ${recipientUid}`);
+        } catch (friendErr) {
+          console.log(`[Queue Processor] [API] Bỏ qua lỗi kết bạn (có thể đã là bạn bè/đã gửi trước đó): ${friendErr.message}`);
+        }
+        
+        // Nghỉ thêm 3 giây trước khi gửi tin nhắn chính
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+
+      await sendMessageViaApi(accountId || 'default', recipientUid, message, imagePath, isGroupTarget);
+      console.log(`[Queue Processor] [API] Đã gửi xong tin nhắn Job ${job.id} cho UID ${recipientUid}`);
       
       // Cập nhật trạng thái thành công trong DB
       if (campaignId && contactId) {
