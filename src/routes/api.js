@@ -8,6 +8,7 @@ import { Account } from '../models/Account.js';
 import { Campaign } from '../models/Campaign.js';
 import { Group } from '../models/Group.js';
 import { GroupMember } from '../models/GroupMember.js';
+import { Blacklist } from '../models/Blacklist.js';
 
 // Đảm bảo thư mục uploads tồn tại
 const uploadDir = path.join(process.cwd(), 'uploads');
@@ -236,6 +237,61 @@ router.get('/contacts', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+// ========================================================================================
+// BLACKLIST API ENDPOINTS
+// ========================================================================================
+
+// API: Get blacklist for an account
+router.get('/blacklist', async (req, res) => {
+  try {
+    const query = req.query.accountId ? { accountId: req.query.accountId } : {};
+    const blacklist = await Blacklist.find(query).sort({ createdAt: -1 });
+    res.json({ success: true, data: blacklist });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// API: Add to blacklist
+router.post('/blacklist', async (req, res) => {
+  try {
+    const { accountId, contactId, name, avatar } = req.body;
+    if (!accountId || !contactId) return res.status(400).json({ error: 'Missing accountId or contactId' });
+
+    const newBlacklist = new Blacklist({
+      accountId,
+      contactId,
+      name: name || 'Không tên',
+      avatar: avatar || ''
+    });
+
+    await newBlacklist.save();
+    res.json({ success: true, message: 'Đã thêm vào danh sách không nhận tin', data: newBlacklist });
+  } catch (error) {
+    if (error.code === 11000) {
+      // Duplicate key error
+      return res.status(400).json({ success: false, error: 'Người này đã có trong danh sách không nhận tin' });
+    }
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// API: Remove from blacklist
+router.delete('/blacklist/:contactId', async (req, res) => {
+  try {
+    const contactId = req.params.contactId;
+    const accountId = req.query.accountId;
+    
+    if (!accountId) return res.status(400).json({ error: 'Missing accountId' });
+
+    await Blacklist.findOneAndDelete({ accountId, contactId });
+    res.json({ success: true, message: 'Đã gỡ khỏi danh sách không nhận tin' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 
 // Import the functions from playwright worker
 import { getLoginQRCode, closeBrowser, syncZaloContacts, syncZaloGroups, syncGroupMembers } from '../scripts/playwright.worker.js';

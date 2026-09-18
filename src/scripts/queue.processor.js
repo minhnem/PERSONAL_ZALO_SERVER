@@ -6,6 +6,7 @@ import path from 'path';
 import { sendMessageToZalo, syncZaloContacts, closeAllBrowsers, sendGroupMemberMessageToZalo } from './playwright.worker.js';
 import { sendMessageViaApi, sendFriendRequestViaApi, closeAllZaloApis } from './zalo-api.worker.js';
 import { Campaign } from '../models/Campaign.js';
+import { Blacklist } from '../models/Blacklist.js';
 
 dotenv.config();
 
@@ -32,6 +33,25 @@ const worker = new Worker('ZaloMessages', async (job) => {
   if (job.name === 'sendCampaignMessage') {
     const { campaignId, accountId, contactId, to, message, imagePath, groupName, recipientName } = job.data;
     
+    // Kiểm tra Blacklist
+    const isBlacklisted = await Blacklist.findOne({ accountId: accountId || 'default', contactId: to });
+    if (isBlacklisted) {
+      console.log(`[Queue Processor] Bỏ qua ${to} vì nằm trong danh sách không nhận tin.`);
+      if (campaignId && contactId) {
+        await Campaign.updateOne(
+          { _id: campaignId, "recipients.contactId": contactId },
+          { $set: { "recipients.$.status": "failed", "recipients.$.errorMessage": "Đã bỏ qua (Blacklist)" } }
+        );
+        
+        // Kiểm tra xem chiến dịch đã hoàn tất toàn bộ chưa
+        const checkCampaign = await Campaign.findById(campaignId);
+        if (checkCampaign && !checkCampaign.recipients.some(r => r.status === 'pending')) {
+          await Campaign.updateOne({ _id: campaignId }, { $set: { status: 'completed' } });
+        }
+      }
+      return; // Dừng xử lý job này
+    }
+
     const delay = Math.floor(Math.random() * (45000 - 20000 + 1) + 20000);
     console.log(`[Queue Processor] Tạm nghỉ ${delay/1000}s trước khi gửi cho ${to} (Chiến dịch)...`);
     await new Promise(resolve => setTimeout(resolve, delay));
@@ -82,6 +102,25 @@ const worker = new Worker('ZaloMessages', async (job) => {
   if (job.name === 'sendCampaignMessageV2') {
     const { campaignId, accountId, contactId, recipientUid, recipientName, message, imagePath, isFriendRequest, friendRequestMessage, isGroupTarget } = job.data;
     
+    // Kiểm tra Blacklist
+    const isBlacklisted = await Blacklist.findOne({ accountId: accountId || 'default', contactId: recipientUid });
+    if (isBlacklisted) {
+      console.log(`[Queue Processor] [API] Bỏ qua ${recipientUid} vì nằm trong danh sách không nhận tin.`);
+      if (campaignId && contactId) {
+        await Campaign.updateOne(
+          { _id: campaignId, "recipients.contactId": contactId },
+          { $set: { "recipients.$.status": "failed", "recipients.$.errorMessage": "Đã bỏ qua (Blacklist)" } }
+        );
+
+        // Kiểm tra xem chiến dịch đã hoàn tất toàn bộ chưa
+        const checkCampaign = await Campaign.findById(campaignId);
+        if (checkCampaign && !checkCampaign.recipients.some(r => r.status === 'pending')) {
+          await Campaign.updateOne({ _id: campaignId }, { $set: { status: 'completed' } });
+        }
+      }
+      return; // Dừng xử lý job này
+    }
+
     const delay = Math.floor(Math.random() * (45000 - 20000 + 1) + 20000);
     console.log(`[Queue Processor] [API] Tạm nghỉ ${delay/1000}s trước khi xử lý Job cho UID ${recipientUid} (${recipientName})...`);
     await new Promise(resolve => setTimeout(resolve, delay));
