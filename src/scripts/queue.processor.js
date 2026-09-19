@@ -7,6 +7,9 @@ import { sendMessageToZalo, syncZaloContacts, closeAllBrowsers, sendGroupMemberM
 import { sendMessageViaApi, sendFriendRequestViaApi, closeAllZaloApis } from './zalo-api.worker.js';
 import { Campaign } from '../models/Campaign.js';
 import { Blacklist } from '../models/Blacklist.js';
+import { Customer } from '../models/Customer.js';
+import { ReminderLog } from '../models/ReminderLog.js';
+import { getAvailableAccount, incrementDailyCount } from '../services/accountService.js';
 
 dotenv.config();
 
@@ -20,52 +23,61 @@ const worker = new Worker('ZaloMessages', async (job) => {
   console.log(`[Queue Processor] Bắt đầu xử lý Job ${job.id} - Tên Job: ${job.name}`);
   
   if (job.name === 'sendMessage') {
-    const { accountId, to, message } = job.data;
+    const { to, message } = job.data;
     
+    const accountId = await getAvailableAccount();
+    if (!accountId) {
+      throw new Error('Vượt quá giới hạn gửi tin 30 tin/ngày của tất cả tài khoản Zalo. Không thể gửi.');
+    }
+
     const delay = Math.floor(Math.random() * (45000 - 20000 + 1) + 20000);
-    console.log(`[Queue Processor] Tạm nghỉ ${delay/1000}s trước khi gửi cho ${to}...`);
+    console.log(`[Queue Processor] Tạm nghỉ ${delay/1000}s trước khi gửi cho ${to} bằng tài khoản ${accountId}...`);
     await new Promise(resolve => setTimeout(resolve, delay));
     
-    await sendMessageToZalo(accountId || 'default', to, message);
-    console.log(`[Queue Processor] Đã gửi xong Job ${job.id}`);
+    await sendMessageToZalo(accountId, to, message);
+    await incrementDailyCount(accountId);
   }
 
   if (job.name === 'sendCampaignMessage') {
-    const { campaignId, accountId, contactId, to, message, imagePath, groupName, recipientName } = job.data;
+    const { campaignId, accountId: assignedAccountId, contactId, to, message, imagePath, groupName, recipientName } = job.data;
     
-    // Kiểm tra Blacklist
-    const isBlacklisted = await Blacklist.findOne({ accountId: accountId || 'default', contactId: to });
+    // Kiểm tra Global Blacklist
+    const isBlacklisted = await Blacklist.findOne({ contactId: to });
     if (isBlacklisted) {
-      console.log(`[Queue Processor] Bỏ qua ${to} vì nằm trong danh sách không nhận tin.`);
+      console.log(`[Queue Processor] Bỏ qua ${to} vì nằm trong danh sách Blacklist (Global).`);
       if (campaignId && contactId) {
         await Campaign.updateOne(
           { _id: campaignId, "recipients.contactId": contactId },
-          { $set: { "recipients.$.status": "failed", "recipients.$.errorMessage": "Đã bỏ qua (Blacklist)" } }
+          { $set: { "recipients.$.status": "failed", "recipients.$.errorMessage": "Đã bỏ qua (Blacklist chung)" } }
         );
         
-        // Kiểm tra xem chiến dịch đã hoàn tất toàn bộ chưa
         const checkCampaign = await Campaign.findById(campaignId);
         if (checkCampaign && !checkCampaign.recipients.some(r => r.status === 'pending')) {
           await Campaign.updateOne({ _id: campaignId }, { $set: { status: 'completed' } });
         }
       }
-      return; // Dừng xử lý job này
+      return; 
     }
 
+    // Tôn trọng tài khoản đã được chỉ định từ giao diện Tạo Chiến Dịch
+    const accountId = assignedAccountId || 'default';
+
     const delay = Math.floor(Math.random() * (45000 - 20000 + 1) + 20000);
-    console.log(`[Queue Processor] Tạm nghỉ ${delay/1000}s trước khi gửi cho ${to} (Chiến dịch)...`);
+    console.log(`[Queue Processor] Tạm nghỉ ${delay/1000}s trước khi gửi cho ${to} (Chiến dịch, qua nick ${accountId})...`);
     await new Promise(resolve => setTimeout(resolve, delay));
     
     try {
       if (groupName) {
         console.log(`[Queue Processor] Gọi luồng gửi tin Thành Viên Nhóm "${groupName}"...`);
-        await sendGroupMemberMessageToZalo(accountId || 'default', groupName, to, message, imagePath);
+        await sendGroupMemberMessageToZalo(accountId, groupName, to, message, imagePath);
       } else {
         console.log(`[Queue Processor] Gọi luồng gửi tin Danh Bạ thông thường...`);
-        await sendMessageToZalo(accountId || 'default', to, message, imagePath, recipientName);
+        await sendMessageToZalo(accountId, to, message, imagePath, recipientName);
       }
       console.log(`[Queue Processor] Đã gửi xong Job ${job.id} (Chiến dịch)`);
       
+      await incrementDailyCount(accountId);
+
       // Cập nhật trạng thái thành công trong DB
       if (campaignId && contactId) {
         await Campaign.updateOne(
@@ -98,50 +110,114 @@ const worker = new Worker('ZaloMessages', async (job) => {
     await syncZaloContacts(job.data.accountId);
   }
 
+  // ====== JOB MỚI: Nhắc mua lại tự động ======
+  if (job.name === 'sendAutoReminderMessage') {
+    const { customerId, productId, productName, phoneNumber, recipientUid, recipientName, message, imagePath, allowedAccountIds } = job.data;
+    
+    const contactIdToCheck = recipientUid || phoneNumber;
+    const isBlacklisted = await Blacklist.findOne({ contactId: contactIdToCheck });
+    if (isBlacklisted) {
+      console.log(`[Queue Processor] [AutoReminder] Bỏ qua ${recipientName} vì nằm trong Global Blacklist.`);
+      return;
+    }
+
+    const accountId = await getAvailableAccount(allowedAccountIds);
+    if (!accountId) {
+      throw new Error('Tất cả tài khoản Zalo đã đạt giới hạn 30 tin/ngày. Vui lòng thử lại vào ngày mai.');
+    }
+
+    const delay = Math.floor(Math.random() * (45000 - 20000 + 1) + 20000);
+    console.log(`[Queue Processor] [AutoReminder] Tạm nghỉ ${delay/1000}s trước khi nhắc ${recipientName} bằng nick ${accountId}...`);
+    await new Promise(resolve => setTimeout(resolve, delay));
+    
+    try {
+      if (recipientUid) {
+        console.log(`[Queue Processor] [AutoReminder] Gửi qua API ZCA bằng UID: ${recipientUid}`);
+        await sendMessageViaApi(accountId, recipientUid, message, imagePath, false);
+      } else {
+        console.log(`[Queue Processor] [AutoReminder] Không có UID, dùng Playwright quét SĐT: ${phoneNumber}`);
+        await sendMessageToZalo(accountId, phoneNumber, message, imagePath, recipientName);
+      }
+      
+      console.log(`[Queue Processor] [AutoReminder] Đã gửi thành công nhắc nhở cho ${recipientName}`);
+      
+      await incrementDailyCount(accountId);
+
+      await Customer.updateOne(
+        { _id: customerId, "trackedProducts._id": productId },
+        { $set: { "trackedProducts.$.hasReminded": true } }
+      );
+
+      await ReminderLog.create({
+        customerId,
+        customerName: recipientName,
+        phone: phoneNumber,
+        productName,
+        accountId,
+        status: 'success'
+      });
+    } catch (err) {
+      console.error(`[Queue Processor] [AutoReminder] Lỗi gửi nhắc nhở:`, err.message);
+      try {
+        await ReminderLog.create({
+          customerId,
+          customerName: recipientName,
+          phone: phoneNumber,
+          productName,
+          accountId: accountId || 'Chưa rõ',
+          status: 'failed',
+          errorMessage: err.message
+        });
+      } catch (logErr) {}
+      throw err;
+    }
+  }
+
   // ====== JOB MỚI: Gửi tin bằng zca-js API (UID trực tiếp, không cần browser) ======
   if (job.name === 'sendCampaignMessageV2') {
-    const { campaignId, accountId, contactId, recipientUid, recipientName, message, imagePath, isFriendRequest, friendRequestMessage, isGroupTarget } = job.data;
+    const { campaignId, accountId: assignedAccountId, contactId, recipientUid, recipientName, message, imagePath, isFriendRequest, friendRequestMessage, isGroupTarget } = job.data;
     
-    // Kiểm tra Blacklist
-    const isBlacklisted = await Blacklist.findOne({ accountId: accountId || 'default', contactId: recipientUid });
+    // Kiểm tra Global Blacklist
+    const isBlacklisted = await Blacklist.findOne({ contactId: recipientUid });
     if (isBlacklisted) {
       console.log(`[Queue Processor] [API] Bỏ qua ${recipientUid} vì nằm trong danh sách không nhận tin.`);
       if (campaignId && contactId) {
         await Campaign.updateOne(
           { _id: campaignId, "recipients.contactId": contactId },
-          { $set: { "recipients.$.status": "failed", "recipients.$.errorMessage": "Đã bỏ qua (Blacklist)" } }
+          { $set: { "recipients.$.status": "failed", "recipients.$.errorMessage": "Đã bỏ qua (Global Blacklist)" } }
         );
 
-        // Kiểm tra xem chiến dịch đã hoàn tất toàn bộ chưa
         const checkCampaign = await Campaign.findById(campaignId);
         if (checkCampaign && !checkCampaign.recipients.some(r => r.status === 'pending')) {
           await Campaign.updateOne({ _id: campaignId }, { $set: { status: 'completed' } });
         }
       }
-      return; // Dừng xử lý job này
+      return; 
     }
 
+    // Tôn trọng tài khoản đã được chỉ định từ giao diện Tạo Chiến Dịch
+    const accountId = assignedAccountId || 'default';
+
     const delay = Math.floor(Math.random() * (45000 - 20000 + 1) + 20000);
-    console.log(`[Queue Processor] [API] Tạm nghỉ ${delay/1000}s trước khi xử lý Job cho UID ${recipientUid} (${recipientName})...`);
+    console.log(`[Queue Processor] [API] Tạm nghỉ ${delay/1000}s trước khi xử lý Job cho UID ${recipientUid} bằng nick ${accountId}...`);
     await new Promise(resolve => setTimeout(resolve, delay));
     
     try {
       if (isFriendRequest) {
-        // Lệnh gửi kết bạn (Bọc try-catch để nếu lỗi do "đã là bạn bè" thì vẫn gửi tin nhắn thường)
         try {
-          await sendFriendRequestViaApi(accountId || 'default', recipientUid, friendRequestMessage);
+          await sendFriendRequestViaApi(accountId, recipientUid, friendRequestMessage);
           console.log(`[Queue Processor] [API] Đã gửi kết bạn cho UID ${recipientUid}`);
         } catch (friendErr) {
-          console.log(`[Queue Processor] [API] Bỏ qua lỗi kết bạn (có thể đã là bạn bè/đã gửi trước đó): ${friendErr.message}`);
+          console.log(`[Queue Processor] [API] Bỏ qua lỗi kết bạn: ${friendErr.message}`);
         }
-        
-        // Nghỉ thêm 3 giây trước khi gửi tin nhắn chính
         await new Promise(resolve => setTimeout(resolve, 3000));
       }
 
-      await sendMessageViaApi(accountId || 'default', recipientUid, message, imagePath, isGroupTarget);
+      await sendMessageViaApi(accountId, recipientUid, message, imagePath, isGroupTarget);
       console.log(`[Queue Processor] [API] Đã gửi xong tin nhắn Job ${job.id} cho UID ${recipientUid}`);
       
+      await incrementDailyCount(accountId);
+
       // Cập nhật trạng thái thành công trong DB
       if (campaignId && contactId) {
         await Campaign.updateOne(

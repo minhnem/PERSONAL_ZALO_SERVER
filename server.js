@@ -23,11 +23,16 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/autozalo'
 });
 
 import './src/scripts/queue.processor.js'; // Start the queue worker
+import { initAutoReminderCron } from './src/scripts/cronAutoReminder.js';
+
 
 const PORT = process.env.PORT || 3001;
 
 app.listen(PORT, async () => {
   console.log(`[AutoZalo Server] is running on http://localhost:${PORT}`);
+  
+  // Start CronJobs
+  initAutoReminderCron();
   
   // Initialize Background Worker
   console.log(`[Worker] Khởi tạo Playwright automation engine ở chế độ ngầm...`);

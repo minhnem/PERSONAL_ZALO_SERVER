@@ -9,6 +9,12 @@ import { Campaign } from '../models/Campaign.js';
 import { Group } from '../models/Group.js';
 import { GroupMember } from '../models/GroupMember.js';
 import { Blacklist } from '../models/Blacklist.js';
+import { ReminderLog } from '../models/ReminderLog.js';
+import customerRoutes from './customerRoutes.js';
+import reminderRuleRoutes from './reminderRuleRoutes.js';
+import settingRoutes from './settingRoutes.js';
+import authRoutes from './authRoutes.js';
+import userRoutes from './userRoutes.js';
 
 // Đảm bảo thư mục uploads tồn tại
 const uploadDir = path.join(process.cwd(), 'uploads');
@@ -30,8 +36,26 @@ const upload = multer({ storage: storage });
 
 const router = express.Router();
 
+// CRM Auto Reminder Routes
+router.use('/customers', customerRoutes);
+router.use('/reminder-rules', reminderRuleRoutes);
+router.use('/settings', settingRoutes);
+
+// License Server Routes
+router.use('/auth', authRoutes);
+router.use('/admin/users', userRoutes);
+
 router.get('/status', (req, res) => {
   res.json({ status: 'OK', message: 'AutoZalo API is running' });
+});
+
+router.get('/reminder-logs', async (req, res) => {
+  try {
+    const logs = await ReminderLog.find().sort({ createdAt: -1 }).limit(200);
+    res.json({ success: true, data: logs });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 router.post('/send-message', async (req, res) => {

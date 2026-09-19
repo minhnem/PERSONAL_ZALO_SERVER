@@ -27,6 +27,13 @@ const accountSchema = new mongoose.Schema({
     default: 'disconnected'
   },
   lastSyncAt: Date,
+  dailySentCount: {
+    type: Number,
+    default: 0
+  },
+  lastSentDate: {
+    type: Date
+  },
   createdAt: {
     type: Date,
     default: Date.now
