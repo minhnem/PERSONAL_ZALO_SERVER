@@ -616,10 +616,10 @@ router.post('/accounts/sync-groups-v2', async (req, res) => {
 
 // API: Quét thành viên nhóm bằng zca-js (V2) — Kể cả thành viên ẨN
 router.post('/accounts/sync-group-members-v2', async (req, res) => {
-  const { accountId, groupId } = req.body;
+  const { accountId, groupId, groupZaloId } = req.body;
   try {
-    if (!accountId || !groupId) throw new Error('Thiếu accountId hoặc groupId');
-    const result = await syncGroupMembersViaApi(accountId, groupId);
+    if (!accountId || !groupId || !groupZaloId) throw new Error('Thiếu accountId, groupId hoặc groupZaloId');
+    const result = await syncGroupMembersViaApi(accountId, groupId, groupZaloId);
     res.json({
       success: true,
       message: `Đã quét ${result.count} thành viên nhóm "${result.groupName}" (UID thật, kể cả ẩn) qua API.`

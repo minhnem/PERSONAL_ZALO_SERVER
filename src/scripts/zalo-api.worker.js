@@ -357,27 +357,27 @@ export const syncGroupsViaApi = async (accountId) => {
 
 /**
  * Quét thành viên nhóm qua zca-js API
- * 1. getGroupInfo(groupId) → memVerList (mảng UID thật của TẤT CẢ thành viên kể cả ẩn)
+ * 1. getGroupInfo(groupZaloId) → memVerList (mảng UID thật của TẤT CẢ thành viên kể cả ẩn)
  * 2. getGroupMembersInfo(memberUids) → displayName, avatar cho mỗi UID
  */
-export const syncGroupMembersViaApi = async (accountId, groupId) => {
+export const syncGroupMembersViaApi = async (accountId, groupId, groupZaloId) => {
   const api = getApi(accountId);
 
-  console.log(`[ZCA Worker] Bắt đầu quét thành viên nhóm ${groupId} cho ${accountId}...`);
+  console.log(`[ZCA Worker] Bắt đầu quét thành viên nhóm ${groupZaloId} cho ${accountId}...`);
 
   try {
     // Bước 1: Lấy danh sách UID thành viên
-    const groupInfoRes = await api.getGroupInfo(groupId);
-    const gridInfo = groupInfoRes.gridInfoMap?.[groupId];
+    const groupInfoRes = await api.getGroupInfo(groupZaloId);
+    const gridInfo = groupInfoRes.gridInfoMap?.[groupZaloId];
 
     if (!gridInfo) {
-      throw new Error(`Không tìm thấy thông tin nhóm ${groupId}. Nhóm có thể đã bị xóa hoặc bạn không phải thành viên.`);
+      throw new Error(`Không tìm thấy thông tin nhóm ${groupZaloId}. Nhóm có thể đã bị xóa hoặc bạn không phải thành viên.`);
     }
 
     const memberUids = (gridInfo.memberIds && gridInfo.memberIds.length > 0)
       ? gridInfo.memberIds
       : (gridInfo.memVerList?.map(id => id.split('_')[0]) || []);
-    const groupName = gridInfo.name || `Nhóm ${groupId}`;
+    const groupName = gridInfo.name || `Nhóm ${groupZaloId}`;
 
     console.log(`[ZCA Worker] Nhóm "${groupName}" có ${memberUids.length} thành viên (kể cả ẩn). Đang lấy thông tin chi tiết...`);
 
