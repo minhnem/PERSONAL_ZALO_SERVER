@@ -96,7 +96,7 @@ export const getLoginQRCode = async (accountId = 'default') => {
 };
 
 // Hàm gửi tin nhắn
-export const sendMessageToZalo = async (accountId = 'default', to, messageTemplate, imagePath = null) => {
+export const sendMessageToZalo = async (accountId = 'default', to, messageTemplate, imagePath = null, recipientName = null) => {
   try {
     const context = await initBrowser(accountId);
     const page = context.pages().find(p => p.url().includes('chat.zalo.me'));
