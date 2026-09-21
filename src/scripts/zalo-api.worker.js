@@ -499,6 +499,10 @@ export const sendMessageViaApi = async (accountId, recipientUid, messageText, im
       .replace(/{year}/g, yearStr)
       .replace(/{random}/g, randomStr);
 
+    // [QUAN TRỌNG] Sửa lỗi khoảng cách dòng xa nhau trên Zalo Desktop khi gửi qua API
+    // Ký tự \r (Carriage Return) từ Windows/Copy-Paste thường bị Zalo Desktop hiểu thành 1 dòng trống phụ.
+    finalMessage = finalMessage.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
     // Chuẩn bị message content cho zca-js
     const messageContent = { msg: finalMessage };
 

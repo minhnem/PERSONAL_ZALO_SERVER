@@ -239,7 +239,14 @@ export const sendMessageToZalo = async (accountId = 'default', to, messageTempla
     console.log(`[Playwright Worker] Gõ nội dung tin nhắn: "${finalMessage}"`);
     const chatInputSelector = '#chatInput, #richInput, [data-id="div_Main_Input_Container"] [contenteditable="true"]';
     await page.locator(chatInputSelector).first().click(); // Click vào ô đầu tiên tìm được
-    await page.locator(chatInputSelector).first().pressSequentially(finalMessage, { delay: 80 });
+    
+    // Sử dụng execCommand('insertText') để chèn toàn bộ văn bản vào ô nhập. 
+    // Cách này giả lập thao tác Paste (Dán) của người dùng. Zalo Web sẽ tự động xử lý ký tự xuống dòng 
+    // thành đúng định dạng chuẩn xác nhất, khắc phục triệt để lỗi khoảng cách xa khi xem trên Zalo Desktop.
+    await page.evaluate((text) => {
+      document.execCommand('insertText', false, text);
+    }, finalMessage);
+    await page.waitForTimeout(500);
 
 
     // 7. Bấm gửi (Enter)
@@ -438,7 +445,12 @@ export const sendGroupMemberMessageToZalo = async (accountId = 'default', groupN
     console.log(`[Playwright Worker] Gõ nội dung tin nhắn: "${finalMessage}"`);
     const chatInputSelector = '#chatInput, #richInput, [data-id="div_Main_Input_Container"] [contenteditable="true"]';
     await page.locator(chatInputSelector).first().click();
-    await page.locator(chatInputSelector).first().pressSequentially(finalMessage, { delay: 80 });
+    
+    // Sử dụng execCommand('insertText') để chèn toàn bộ văn bản vào ô nhập. 
+    await page.evaluate((text) => {
+      document.execCommand('insertText', false, text);
+    }, finalMessage);
+    await page.waitForTimeout(500);
 
     // Enter
     console.log(`[Playwright Worker] Bấm Gửi (Enter)...`);
