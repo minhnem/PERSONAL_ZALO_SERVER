@@ -84,6 +84,31 @@ router.post('/send-message', async (req, res) => {
   }
 });
 
+router.post('/send-friend-by-phone', async (req, res) => {
+  const { accountId, phoneNumbers, message } = req.body;
+  
+  if (!accountId || !phoneNumbers || !message) {
+    return res.status(400).json({ error: 'Missing accountId, phoneNumbers, or message' });
+  }
+
+  try {
+    const job = await zaloMessageQueue.add('sendFriendRequestByPhone', {
+      accountId,
+      phoneNumbers: Array.isArray(phoneNumbers) ? phoneNumbers : [phoneNumbers],
+      message,
+      timestamp: Date.now()
+    });
+
+    res.json({
+      success: true,
+      message: 'Đã đưa yêu cầu kết bạn bằng SĐT vào hàng đợi chờ xử lý.',
+      jobId: job.id
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // API: Get accounts
 router.get('/accounts', async (req, res) => {
   try {
@@ -323,7 +348,7 @@ import { getLoginQRCode, closeBrowser, syncZaloContacts, syncZaloGroups, syncGro
 // Import the functions from zca-js worker (API trực tiếp, không cần browser)
 import {
   initZaloApi, syncFriendsViaApi, syncGroupsViaApi,
-  syncGroupMembersViaApi, sendMessageViaApi,
+  syncGroupMembersViaApi, syncGroupMembersViaLinkApi, sendMessageViaApi,
   extractCredentialsFromPlaywright, getZaloApiStatus,
   closeZaloApi
 } from '../scripts/zalo-api.worker.js';
@@ -539,6 +564,36 @@ router.delete('/campaigns/:id', async (req, res) => {
   }
 });
 
+// API: Cancel campaign
+router.post('/campaigns/:id/cancel', async (req, res) => {
+  try {
+    const campaign = await Campaign.findById(req.params.id);
+    if (!campaign) {
+      return res.status(404).json({ success: false, error: 'Không tìm thấy chiến dịch' });
+    }
+
+    if (campaign.status === 'completed' || campaign.status === 'cancelled') {
+      return res.status(400).json({ success: false, error: 'Chiến dịch đã kết thúc hoặc đã hủy' });
+    }
+
+    // Set status to cancelled
+    campaign.status = 'cancelled';
+    
+    // Set all pending recipients to failed
+    campaign.recipients.forEach(r => {
+      if (r.status === 'pending') {
+        r.status = 'failed';
+        r.errorMessage = 'Đã hủy bởi người dùng';
+      }
+    });
+
+    await campaign.save();
+    res.json({ success: true, message: 'Đã hủy chiến dịch thành công' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // ========================================================================================
 // ZCA-JS API ENDPOINTS (V2) — Quét data & gửi tin bằng Internal API thay vì Browser
 // ========================================================================================
@@ -623,6 +678,21 @@ router.post('/accounts/sync-group-members-v2', async (req, res) => {
     res.json({
       success: true,
       message: `Đã quét ${result.count} thành viên nhóm "${result.groupName}" (UID thật, kể cả ẩn) qua API.`
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// API: Tạo chiến dịch gửi tin bằng UID qua zca-js (V2)
+router.post('/accounts/sync-group-members-by-link', async (req, res) => {
+  const { accountId, groupLink } = req.body;
+  try {
+    if (!accountId || !groupLink) throw new Error('Thiếu accountId hoặc groupLink');
+    const result = await syncGroupMembersViaLinkApi(accountId, groupLink);
+    res.json({
+      success: true,
+      message: `Đã quét ${result.count} thành viên từ link nhóm "${result.groupName}" qua API.`
     });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });

@@ -382,11 +382,57 @@ export const syncGroupMembersViaApi = async (accountId, groupId, groupZaloId) =>
     console.log(`[ZCA Worker] Nhóm "${groupName}" có ${memberUids.length} thành viên (kể cả ẩn). Đang lấy thông tin chi tiết...`);
 
     if (memberUids.length === 0) {
-      console.log(`[ZCA Worker] Nhóm rỗng, không có thành viên.`);
-      return { success: true, count: 0, groupName };
+      console.log(`[ZCA Worker] Zalo chặn danh sách thành viên. Đang thử lấy qua link mời (nếu có)...`);
+      try {
+        const linkDetail = await api.getGroupLinkDetail(groupZaloId);
+        if (linkDetail && linkDetail.enabled === 1 && linkDetail.link) {
+          console.log(`[ZCA Worker] Nhóm đang bật link mời (${linkDetail.link}). Quét qua link...`);
+          
+          let page = 1;
+          let hasMore = true;
+          const membersToSave = [];
+
+          while (hasMore) {
+            const res = await api.getGroupLinkInfo({ link: linkDetail.link, memberPage: page });
+            if (res && res.currentMems) {
+              for (const m of res.currentMems) {
+                membersToSave.push({
+                  accountId,
+                  groupId,
+                  zaloId: m.id,
+                  displayName: m.zaloName || m.dName || '',
+                  name: m.dName || m.zaloName || `Thành viên ${m.id.substring(0, 8)}`,
+                  avatar: m.avatar || m.avatar_25 || '',
+                });
+              }
+            }
+            if (res && res.hasMoreMember === 1) {
+              page++;
+              await new Promise(r => setTimeout(r, 1000));
+            } else {
+              hasMore = false;
+            }
+          }
+
+          if (membersToSave.length > 0) {
+            await GroupMember.deleteMany({ accountId, groupId });
+            await GroupMember.insertMany(membersToSave);
+            console.log(`[ZCA Worker] ✅ Đã lưu ${membersToSave.length} thành viên nhóm "${groupName}" (qua Link Mời) vào DB.`);
+            return { success: true, count: membersToSave.length, groupName, fallbackUsed: true };
+          }
+        } else {
+          console.log(`[ZCA Worker] Nhóm KHÔNG bật link mời. Kết thúc thử nghiệm link.`);
+        }
+      } catch (linkErr) {
+        console.log(`[ZCA Worker] Lỗi thử quét qua link mời: ${linkErr.message}`);
+      }
+
+      console.log(`[ZCA Worker] Không thể quét thành viên do Zalo chặn diện rộng.`);
+      // Ném lỗi với câu văn chính xác để UI hiển thị theo yêu cầu "Vấn đề 2"
+      throw new Error("Zalo hiện đã ẩn danh sách thành viên cho nhóm này (chặn diện rộng).");
     }
 
-    // Bước 2: Lấy profile từng thành viên (batch 50 UIDs/lần)
+    // Bước 2: Lấy profile từng thành viên (batch 50 UIDs/lần) bằng getUserInfo (vượt rào Zalo)
     const BATCH_SIZE = 50;
     const membersToSave = [];
 
@@ -394,18 +440,21 @@ export const syncGroupMembersViaApi = async (accountId, groupId, groupZaloId) =>
       const batch = memberUids.slice(i, i + BATCH_SIZE);
 
       try {
-        const membersInfoRes = await api.getGroupMembersInfo(batch);
-        const profiles = membersInfoRes.profiles || {};
+        // Dùng getUserInfo (trả về cả người lạ) thay vì getGroupMembersInfo (bị lock)
+        const profilesRes = await api.getUserInfo(batch);
+        const changedProfiles = profilesRes.changed_profiles || {};
 
         for (const uid of batch) {
-          const profile = profiles[uid];
+          // Key trả về thường có đuôi "_0", vd: "123456_0"
+          const profile = changedProfiles[`${uid}_0`] || changedProfiles[uid] || {};
+          
           membersToSave.push({
             accountId,
             groupId,
-            zaloId: uid, // UID THẬT — không phải "zalo_id_mem_TênNgười" nữa
-            displayName: profile?.zaloName || profile?.displayName || '',
-            name: profile?.displayName || profile?.zaloName || `Thành viên ${uid.substring(0, 8)}`,
-            avatar: profile?.avatar || '',
+            zaloId: uid,
+            displayName: profile.zaloName || profile.displayName || '',
+            name: profile.displayName || profile.zaloName || `Thành viên ${uid.substring(0, 8)}`,
+            avatar: profile.avatar || '',
           });
         }
       } catch (batchErr) {
@@ -447,6 +496,102 @@ export const syncGroupMembersViaApi = async (accountId, groupId, groupZaloId) =>
 };
 
 // ========================================================================================
+// QUÉT THÀNH VIÊN NHÓM QUA LINK (ZCA-JS V2)
+// ========================================================================================
+
+/**
+ * Quét thành viên nhóm thông qua link tham gia (không cần ở trong nhóm)
+ * @param {string} accountId 
+ * @param {string} groupLink 
+ */
+export const syncGroupMembersViaLinkApi = async (accountId, groupLink) => {
+  const api = getApi(accountId);
+  console.log(`[ZCA Worker] Bắt đầu quét thành viên nhóm từ link ${groupLink} cho ${accountId}...`);
+
+  try {
+    let allMembers = [];
+    let page = 1;
+    let hasMore = true;
+    let groupInfo = null;
+
+    // 1. Phân trang lấy tất cả thành viên qua link
+    while (hasMore) {
+      console.log(`[ZCA Worker] Đang tải trang ${page}...`);
+      const res = await api.getGroupLinkInfo({ link: groupLink, memberPage: page });
+      
+      if (!groupInfo && res) {
+        groupInfo = {
+          groupId: res.groupId,
+          name: res.name || `Nhóm Zalo ${res.groupId}`,
+          avatar: res.avt || res.fullAvt || '',
+          totalMember: res.totalMember || 0
+        };
+      }
+
+      if (res && res.currentMems) {
+        allMembers.push(...res.currentMems);
+      }
+
+      if (res && res.hasMoreMember === 1) {
+        page++;
+        await new Promise(r => setTimeout(r, 1000)); // Delay tránh rate limit
+      } else {
+        hasMore = false;
+      }
+    }
+
+    if (!groupInfo) {
+      throw new Error('Không thể lấy thông tin nhóm. Link không hợp lệ hoặc nhóm đã bị giải tán.');
+    }
+
+    console.log(`[ZCA Worker] Quét được tổng cộng ${allMembers.length} thành viên từ link nhóm "${groupInfo.name}".`);
+
+    // 2. Lưu/Cập nhật thông tin Nhóm vào bảng Group
+    let groupRecord = await Group.findOne({ accountId, zaloId: groupInfo.groupId });
+    if (!groupRecord) {
+      groupRecord = new Group({
+        accountId,
+        zaloId: groupInfo.groupId, // groupId toàn cầu của Zalo
+        name: groupInfo.name,
+        avatar: groupInfo.avatar,
+        type: 'group_from_link',
+        memberCount: allMembers.length
+      });
+      await groupRecord.save();
+      console.log(`[ZCA Worker] Đã tạo mới bản ghi nhóm "${groupInfo.name}" trong CSDL.`);
+    } else {
+      groupRecord.name = groupInfo.name;
+      groupRecord.avatar = groupInfo.avatar;
+      groupRecord.memberCount = allMembers.length;
+      await groupRecord.save();
+    }
+
+    // 3. Xử lý lưu thành viên vào GroupMember
+    if (allMembers.length > 0) {
+      const membersToSave = allMembers.map(m => ({
+        accountId,
+        groupId: groupRecord._id, // Khóa ngoại trỏ đến _id của Group trong MongoDB
+        zaloId: m.id,             // UID thật được cấp cục bộ cho nick này
+        displayName: m.zaloName || m.dName || '',
+        name: m.dName || m.zaloName || `Thành viên ${m.id.substring(0, 8)}`,
+        avatar: m.avatar || m.avatar_25 || '',
+      }));
+
+      // Xóa thành viên cũ (thuộc Group này và Account này) trước khi insert mới
+      await GroupMember.deleteMany({ accountId, groupId: groupRecord._id });
+      await GroupMember.insertMany(membersToSave);
+      
+      console.log(`[ZCA Worker] ✅ Đã lưu ${membersToSave.length} thành viên từ link vào DB thành công.`);
+    }
+
+    return { success: true, count: allMembers.length, groupName: groupInfo.name };
+  } catch (error) {
+    console.error(`[ZCA Worker] ❌ Lỗi quét nhóm qua link:`, error.message);
+    throw error;
+  }
+};
+
+// ========================================================================================
 // GỬI TIN NHẮN BẰNG UID
 // ========================================================================================
 
@@ -460,10 +605,21 @@ export const syncGroupMembersViaApi = async (accountId, groupId, groupZaloId) =>
  */
 export const sendMessageViaApi = async (accountId, recipientUid, messageText, imagePath = null, isGroupTarget = false) => {
   const api = getApi(accountId);
+  let finalUid = recipientUid;
 
-  console.log(`[ZCA Worker] Đang gửi tin nhắn cho UID: ${recipientUid}...`);
+  console.log(`[ZCA Worker] Đang gửi tin nhắn cho UID/SĐT: ${recipientUid}...`);
 
   try {
+    // Tự động nhận diện nếu đầu vào là số điện thoại
+    if (/^(0|84)\d{8,9}$/.test(finalUid)) {
+      console.log(`[ZCA Worker] Phát hiện đầu vào là SĐT (${finalUid}), đang tra cứu UID...`);
+      const user = await api.findUser(finalUid);
+      if (!user || !user.uid) {
+        throw new Error(`Không tìm thấy Zalo của SĐT ${finalUid}`);
+      }
+      finalUid = user.uid;
+      console.log(`[ZCA Worker] Đã dịch SĐT ${recipientUid} thành UID: ${finalUid}`);
+    }
     // Xử lý Spintax (giống logic trong playwright.worker.js)
     let finalMessage = messageText.replace(/\{([^{}]*\|[^{}]*)\}/g, (match, p1) => {
       const options = p1.split('|');
@@ -475,8 +631,8 @@ export const sendMessageViaApi = async (accountId, recipientUid, messageText, im
     let recipientName = 'bạn';
     try {
       // Tìm trong Contact hoặc GroupMember
-      const contact = await Contact.findOne({ zaloId: recipientUid });
-      const member = await GroupMember.findOne({ zaloId: recipientUid });
+      const contact = await Contact.findOne({ zaloId: finalUid });
+      const member = await GroupMember.findOne({ zaloId: finalUid });
       recipientName = contact?.name || member?.name || 'bạn';
     } catch (e) { /* ignore */ }
 
@@ -515,15 +671,25 @@ export const sendMessageViaApi = async (accountId, recipientUid, messageText, im
     // Gửi tin nhắn bằng UID — CHÍNH XÁC 100%, KHÔNG BAO GIỜ NHẦM NGƯỜI
     const result = await api.sendMessage(
       messageContent,
-      recipientUid,
+      finalUid,
       isGroupTarget ? ThreadType.Group : ThreadType.User
     );
 
-    console.log(`[ZCA Worker] ✅ Gửi tin thành công cho UID ${recipientUid}. MsgId: ${result?.message?.msgId || 'N/A'}`);
+    console.log(`[ZCA Worker] ✅ Gửi tin thành công cho UID ${finalUid}. MsgId: ${result?.message?.msgId || 'N/A'}`);
 
     return { success: true, msgId: result?.message?.msgId };
   } catch (error) {
-    console.error(`[ZCA Worker] ❌ Lỗi gửi tin cho UID ${recipientUid}:`, error.message);
+    // console.error(`[ZCA Worker] ❌ Lỗi gửi tin cho UID ${finalUid}:`, error.message);
+    console.error(`\n========== ZCA SEND ERROR ==========`);
+    console.error(`UID: ${finalUid}`);
+    console.error(`message: ${error?.message}`);
+    console.error(`name: ${error?.name}`);
+    console.error(`code: ${error?.code}`);
+    console.error(`status: ${error?.response?.status}`);
+    console.error(`response:`, error?.response?.data);
+    console.error(`====================================\n`);
+
+    // throw error;
     throw error;
   }
 };
@@ -534,12 +700,24 @@ export const sendMessageViaApi = async (accountId, recipientUid, messageText, im
 export const sendFriendRequestViaApi = async (accountId, recipientUid, message) => {
   try {
     const api = getApi(accountId);
+    let finalUid = recipientUid;
+
+    // Tự động nhận diện nếu đầu vào là số điện thoại
+    if (/^(0|84)\d{8,9}$/.test(finalUid)) {
+      console.log(`[ZCA Worker] Phát hiện gửi kết bạn cho SĐT (${finalUid}), đang tra cứu UID...`);
+      const user = await api.findUser(finalUid);
+      if (!user || !user.uid) {
+        throw new Error(`Không tìm thấy Zalo của SĐT ${finalUid}`);
+      }
+      finalUid = user.uid;
+      console.log(`[ZCA Worker] Đã dịch SĐT ${recipientUid} thành UID: ${finalUid}`);
+    }
 
     // Xử lý Shortcodes cá nhân hóa
     let recipientName = 'bạn';
     try {
-      const contact = await Contact.findOne({ zaloId: recipientUid });
-      const member = await GroupMember.findOne({ zaloId: recipientUid });
+      const contact = await Contact.findOne({ zaloId: finalUid });
+      const member = await GroupMember.findOne({ zaloId: finalUid });
       recipientName = contact?.name || member?.name || 'bạn';
     } catch (e) { /* ignore */ }
 
@@ -562,16 +740,16 @@ export const sendFriendRequestViaApi = async (accountId, recipientUid, message) 
       .replace(/{datetime}/g, `${timeStr} ${dateStr}`)
       .replace(/{year}/g, yearStr)
       .replace(/{random}/g, randomStr);
-      
+
     // Đảm bảo không vượt quá ~150 ký tự
     if (finalMessage.length > 150) {
       finalMessage = finalMessage.substring(0, 150);
       console.warn(`[ZCA Worker] Lời mời kết bạn quá dài, đã cắt bớt: ${finalMessage}`);
     }
 
-    const result = await api.sendFriendRequest(finalMessage, recipientUid);
+    const result = await api.sendFriendRequest(finalMessage, finalUid);
 
-    console.log(`[ZCA Worker] ✅ Gửi yêu cầu kết bạn thành công cho UID ${recipientUid}`);
+    console.log(`[ZCA Worker] ✅ Gửi yêu cầu kết bạn thành công cho UID ${finalUid}`);
     return { success: true, result };
   } catch (error) {
     console.error(`[ZCA Worker] ❌ Lỗi gửi kết bạn cho UID ${recipientUid}:`, error.message);
@@ -579,3 +757,61 @@ export const sendFriendRequestViaApi = async (accountId, recipientUid, message) 
     throw error;
   }
 };
+
+/**
+ * Gửi yêu cầu kết bạn (kèm lời nhắn) thông qua số điện thoại.
+ * Sử dụng API để tra cứu SĐT thành UID, sau đó gọi sendFriendRequest.
+ * 
+ * @param {string} accountId - Số điện thoại tài khoản nguồn
+ * @param {string} phoneNumber - Số điện thoại người cần kết bạn
+ * @param {string} message - Lời nhắn kết bạn
+ * @returns {Promise<Object>} - Thông tin kết quả (UID nếu thành công)
+ */
+export const sendFriendRequestByPhoneViaApi = async (accountId, phoneNumber, message) => {
+  const api = getApi(accountId);
+  console.log(`[ZCA Worker] Yêu cầu kết bạn qua SĐT ${phoneNumber} từ tài khoản ${accountId}...`);
+
+  try {
+    // 1. Tìm Zalo ID (UID) từ SĐT
+    const user = await api.findUser(phoneNumber);
+    if (!user || !user.uid) {
+      throw new Error(`Không tìm thấy tài khoản Zalo nào gắn với SĐT ${phoneNumber}`);
+    }
+
+    // 2. Format lời nhắn giống hệt hàm sendFriendRequestViaApi (cắt chuỗi, thay thế biến)
+    const recipientName = user.zaloName || user.displayName || phoneNumber;
+    let finalMessage = message || '';
+    
+    // Replace các biến cơ bản
+    const parts = recipientName.split(' ');
+    const lastName = parts[0];
+    const firstName = parts.length > 1 ? parts[parts.length - 1] : parts[0];
+    const now = new Date();
+    const dateStr = `${now.getDate().toString().padStart(2, '0')}/${(now.getMonth() + 1).toString().padStart(2, '0')}`;
+    const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+    const yearStr = now.getFullYear().toString();
+    const randomStr = Math.random().toString(36).substring(7);
+
+    finalMessage = finalMessage
+      .replace(/{name}/g, recipientName)
+      .replace(/{first_name}/g, firstName)
+      .replace(/{last_name}/g, lastName)
+      .replace(/{date}/g, dateStr)
+      .replace(/{datetime}/g, `${timeStr} ${dateStr}`)
+      .replace(/{year}/g, yearStr)
+      .replace(/{random}/g, randomStr);
+
+    if (finalMessage.length > 150) {
+      finalMessage = finalMessage.substring(0, 150);
+    }
+
+    // 3. Gửi lời mời kết bạn
+    const result = await api.sendFriendRequest(finalMessage, user.uid);
+    console.log(`[ZCA Worker] ✅ Đã gửi lời mời kết bạn thành công cho ${phoneNumber} (UID: ${user.uid})`);
+    return { success: true, uid: user.uid, result };
+  } catch (error) {
+    console.error(`[ZCA Worker] ❌ Lỗi khi gửi kết bạn cho SĐT ${phoneNumber}:`, error.message);
+    throw error;
+  }
+};
+

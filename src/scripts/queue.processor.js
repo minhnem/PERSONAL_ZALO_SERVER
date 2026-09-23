@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import { sendMessageToZalo, syncZaloContacts, closeAllBrowsers, sendGroupMemberMessageToZalo } from './playwright.worker.js';
-import { sendMessageViaApi, sendFriendRequestViaApi, closeAllZaloApis } from './zalo-api.worker.js';
+import { sendMessageViaApi, sendFriendRequestViaApi, closeAllZaloApis, sendFriendRequestByPhoneViaApi } from './zalo-api.worker.js';
 import { Campaign } from '../models/Campaign.js';
 import { Blacklist } from '../models/Blacklist.js';
 import { Customer } from '../models/Customer.js';
@@ -41,6 +41,15 @@ const worker = new Worker('ZaloMessages', async (job) => {
   if (job.name === 'sendCampaignMessage') {
     const { campaignId, accountId: assignedAccountId, contactId, to, message, imagePath, groupName, recipientName } = job.data;
     
+    // Kiểm tra xem chiến dịch đã bị hủy chưa
+    if (campaignId) {
+      const checkCampaign = await Campaign.findById(campaignId);
+      if (!checkCampaign || checkCampaign.status === 'cancelled') {
+        console.log(`[Queue Processor] Bỏ qua ${to} vì chiến dịch đã bị hủy.`);
+        return;
+      }
+    }
+
     // Kiểm tra Global Blacklist
     const isBlacklisted = await Blacklist.findOne({ contactId: to });
     if (isBlacklisted) {
@@ -177,6 +186,15 @@ const worker = new Worker('ZaloMessages', async (job) => {
   if (job.name === 'sendCampaignMessageV2') {
     const { campaignId, accountId: assignedAccountId, contactId, recipientUid, recipientName, message, imagePath, isFriendRequest, friendRequestMessage, isGroupTarget } = job.data;
     
+    // Kiểm tra xem chiến dịch đã bị hủy chưa
+    if (campaignId) {
+      const checkCampaign = await Campaign.findById(campaignId);
+      if (!checkCampaign || checkCampaign.status === 'cancelled') {
+        console.log(`[Queue Processor] [API] Bỏ qua ${recipientUid} vì chiến dịch đã bị hủy.`);
+        return;
+      }
+    }
+
     // Kiểm tra Global Blacklist
     const isBlacklisted = await Blacklist.findOne({ contactId: recipientUid });
     if (isBlacklisted) {
@@ -241,6 +259,25 @@ const worker = new Worker('ZaloMessages', async (job) => {
         if (checkCampaign && !checkCampaign.recipients.some(r => r.status === 'pending')) {
           await Campaign.updateOne({ _id: campaignId }, { $set: { status: 'completed' } });
         }
+      }
+    }
+  }
+
+  if (job.name === 'sendFriendRequestByPhone') {
+    const { accountId, phoneNumbers, message } = job.data;
+    
+    // accountId có thể là mảng hoặc string, lấy cái khả dụng
+    const activeAccountId = await getAvailableAccount() || accountId;
+
+    for (const phone of phoneNumbers) {
+      const delay = Math.floor(Math.random() * (15000 - 5000 + 1) + 5000); // 5-15s delay giữa mỗi SĐT
+      console.log(`[Queue Processor] [API] Tạm nghỉ ${delay/1000}s trước khi gửi yêu cầu kết bạn cho SĐT ${phone}...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      
+      try {
+        await sendFriendRequestByPhoneViaApi(activeAccountId, phone, message);
+      } catch (err) {
+        console.error(`[Queue Processor] [API] Bỏ qua lỗi kết bạn cho ${phone}: ${err.message}`);
       }
     }
   }
