@@ -692,7 +692,9 @@ router.post('/accounts/sync-group-members-by-link', async (req, res) => {
     const result = await syncGroupMembersViaLinkApi(accountId, groupLink);
     res.json({
       success: true,
-      message: `Đã quét ${result.count} thành viên từ link nhóm "${result.groupName}" qua API.`
+      message: `Đã quét ${result.count} thành viên từ link nhóm "${result.groupName}". File Excel đang được tải xuống...`,
+      members: result.members,
+      groupName: result.groupName
     });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });

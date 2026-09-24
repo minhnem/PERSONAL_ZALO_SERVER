@@ -6,6 +6,179 @@ import { Contact } from '../models/Contact.js';
 import { Group } from '../models/Group.js';
 import { GroupMember } from '../models/GroupMember.js';
 import { Account } from '../models/Account.js';
+import crypto from 'node:crypto';
+import axios from 'axios';
+
+// ========================================================================================
+// GET HIDDEN MEMBERS API CONFIG & HELPERS
+// ========================================================================================
+const IV = Buffer.from('00000000000000000000000000000000', 'hex');
+const algorithm = 'aes-128-cbc';
+const zpw_type = 30;
+const zpw_ver = 685;
+
+function encrypt(data, key) {
+  const cipher = crypto.createCipheriv(algorithm, Buffer.from(key, 'base64'), IV);
+  let encrypted = cipher.update(data, 'utf8', 'base64');
+  encrypted += cipher.final('base64');
+  return encrypted;
+}
+
+function decrypt(encoded, key) {
+  const decipher = crypto.createDecipheriv(algorithm, Buffer.from(key, 'base64'), IV);
+  let decrypted = decipher.update(encoded, 'base64', 'utf8');
+  decrypted += decipher.final('utf8');
+  return JSON.parse(decrypted);
+}
+
+const getTimestamp = () => Math.floor(Date.now() / 1000);
+
+function setHeaderReq(cookie) {
+  return {
+    origin: 'https://chat.zalo.me',
+    priority: 'u=1, i',
+    referer: 'https://chat.zalo.me/',
+    'sec-ch-ua': '"Opera";v="111", "Chromium";v="125", "Not.A/Brand";v="24"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-site',
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 OPR/111.0.0.0',
+    cookie
+  };
+}
+
+async function fetchZpwEnk(cookie, imei) {
+  const url = `https://wpa.zalo.me/api/login/getLoginInfo?zpw_ver=${zpw_ver}&zpw_type=${zpw_type}&nretry=0&imei=${imei}&os=Web&language=vi&ts=${getTimestamp()}`;
+  try {
+    const response = await axios.get(url, { headers: setHeaderReq(cookie) });
+    if (response.status === 200 && response.data?.data) {
+      return response.data.data.zpw_enk;
+    }
+  } catch (error) {
+    console.error(`[ZCA Worker] Lỗi lấy zpw_enk:`, error.message);
+  }
+  return null;
+}
+
+async function fetchHiddenMemberIds(cookie, imei, zpw_enk, groupId) {
+  if (!/^[-0-9]+$/.test(groupId) && !/^\d+$/.test(groupId)) return null; 
+  
+  let allHiddenIds = [];
+  let mpage = 1;
+  let hasMore = true;
+
+  while(hasMore) {
+    const body = JSON.stringify({
+      mcount: 500,
+      grid: groupId,
+      mpage: mpage,
+      imei,
+      avatar_size: 120,
+      member_avatar_size: 120
+    });
+    const encryptedParams = encodeURIComponent(encrypt(body, zpw_enk));
+    const url = `https://tt-group-wpa.chat.zalo.me/api/group/getgi/v2?zpw_ver=${zpw_ver}&zpw_type=${zpw_type}&nretry=0&params=${encryptedParams}`;
+    
+    try {
+      const response = await axios.get(url, { headers: setHeaderReq(cookie) });
+      if (response.status === 200) {
+        const data = decrypt(response.data?.data, zpw_enk);
+        const ids = data.data?.memberIds || [];
+        if (ids.length > 0) {
+          allHiddenIds.push(...ids);
+          if (ids.length < 500) {
+            hasMore = false;
+          } else {
+            mpage++;
+            await new Promise(r => setTimeout(r, 500)); // Delay nhẹ
+          }
+        } else {
+          hasMore = false;
+        }
+      } else {
+        hasMore = false;
+      }
+    } catch (error) {
+      console.error(`[ZCA Worker] Lỗi API getgi/v2 trang ${mpage}:`, error.message);
+      hasMore = false;
+    }
+  }
+  return allHiddenIds;
+}
+
+async function fetchGroupMembersByMg(cookie, imei, zpw_enk, groupId) {
+  let allMembers = [];
+  let mpage = 1;
+  let hasMore = true;
+  const local_zpw_ver = 623;
+
+  while(hasMore) {
+    const body = JSON.stringify({
+      grids: [groupId],
+      avatar_size: 160,
+      member_avatar_size: 160,
+      mpage: mpage,
+      mcount: 50
+    });
+    const encryptedParams = encodeURIComponent(encrypt(body, zpw_enk));
+    const url = `https://tt-group-wpa.chat.zalo.me/api/group/getmg?zpw_ver=${local_zpw_ver}&zpw_type=${zpw_type}&nretry=0&params=${encryptedParams}`;
+    
+    try {
+      const response = await axios.get(url, { headers: setHeaderReq(cookie) });
+      if (response.status === 200) {
+        const parsed = decrypt(response.data?.data, zpw_enk);
+        
+        let membersData = [];
+        if (parsed.data) {
+           let groupData = parsed.data[groupId];
+           if (!groupData && typeof parsed.data === 'object' && !Array.isArray(parsed.data)) {
+               groupData = Object.values(parsed.data)[0];
+           }
+
+           if (groupData) {
+               if (Array.isArray(groupData)) membersData = groupData;
+               else if (Array.isArray(groupData.members)) membersData = groupData.members;
+               else if (Array.isArray(groupData.memberIds)) membersData = groupData.memberIds;
+           } else if (Array.isArray(parsed.data)) {
+               membersData = parsed.data;
+           }
+        }
+        
+        if (membersData.length === 0) {
+          console.log(`[ZCA Worker] Debug getmg trả về rỗng. Raw parsed:`, JSON.stringify(parsed).substring(0, 1500));
+        }
+
+        if (Array.isArray(membersData) && membersData.length > 0) {
+          // Lọc trùng lặp để chống infinite loop (trường hợp API trả về toàn bộ thành viên trong 1 page)
+          const newMembers = membersData.filter(m => !allMembers.some(existing => (existing.id || existing.uid) === (m.id || m.uid)));
+          
+          if (newMembers.length === 0) {
+             hasMore = false;
+          } else {
+             allMembers.push(...newMembers);
+             if (membersData.length < 50 || mpage >= 100) { // Giới hạn mpage 100 để tránh vô hạn
+               hasMore = false;
+             } else {
+               mpage++;
+               await new Promise(r => setTimeout(r, 500));
+             }
+          }
+        } else {
+          hasMore = false;
+        }
+      } else {
+        hasMore = false;
+      }
+    } catch (error) {
+      console.error(`[ZCA Worker] Lỗi API getmg trang ${mpage}:`, error.message);
+      hasMore = false;
+    }
+  }
+  return allMembers;
+}
 
 // ========================================================================================
 // ZCA-JS WORKER MODULE
@@ -374,10 +547,39 @@ export const syncGroupMembersViaApi = async (accountId, groupId, groupZaloId) =>
       throw new Error(`Không tìm thấy thông tin nhóm ${groupZaloId}. Nhóm có thể đã bị xóa hoặc bạn không phải thành viên.`);
     }
 
-    const memberUids = (gridInfo.memberIds && gridInfo.memberIds.length > 0)
+    let memberUids = (gridInfo.memberIds && gridInfo.memberIds.length > 0)
       ? gridInfo.memberIds
       : (gridInfo.memVerList?.map(id => id.split('_')[0]) || []);
     const groupName = gridInfo.name || `Nhóm ${groupZaloId}`;
+
+    // LUÔN LUÔN quét qua API getgi/v2 để vét cạn thành viên ẩn, hoặc khi Zalo chỉ trả về 1 phần
+    console.log(`[ZCA Worker] Bắt đầu quét qua API getgi/v2 (mã hoá AES) để vét cạn thành viên ẩn...`);
+    try {
+      const account = await Account.findOne({ phoneNumber: accountId });
+      if (account && account.zcaCredentials) {
+        const credentials = account.zcaCredentials;
+        let cookieStr = credentials.cookie;
+        if (Array.isArray(cookieStr)) {
+          cookieStr = cookieStr.map(c => `${c.name}=${c.value}`).join('; ');
+        }
+        const imei = credentials.imei;
+        const zpw_enk = await fetchZpwEnk(cookieStr, imei);
+        
+        if (zpw_enk) {
+            const hiddenIds = await fetchHiddenMemberIds(cookieStr, imei, zpw_enk, groupZaloId);
+            if (hiddenIds && hiddenIds.length > 0) {
+                // Gộp danh sách, loại bỏ UID trùng lặp
+                const combined = Array.from(new Set([...memberUids, ...hiddenIds]));
+                console.log(`[ZCA Worker] ✅ Tìm thêm được ${combined.length - memberUids.length} UIDs ẩn. Tổng cộng: ${combined.length} UIDs.`);
+                memberUids = combined;
+            }
+        } else {
+            console.log(`[ZCA Worker] ❌ Không lấy được zpw_enk.`);
+        }
+      }
+    } catch (err) {
+      console.log(`[ZCA Worker] ❌ Lỗi gọi API getgi/v2:`, err.message);
+    }
 
     console.log(`[ZCA Worker] Nhóm "${groupName}" có ${memberUids.length} thành viên (kể cả ẩn). Đang lấy thông tin chi tiết...`);
 
@@ -510,81 +712,225 @@ export const syncGroupMembersViaLinkApi = async (accountId, groupLink) => {
 
   try {
     let allMembers = [];
-    let page = 1;
-    let hasMore = true;
-    let groupInfo = null;
-
-    // 1. Phân trang lấy tất cả thành viên qua link
-    while (hasMore) {
-      console.log(`[ZCA Worker] Đang tải trang ${page}...`);
-      const res = await api.getGroupLinkInfo({ link: groupLink, memberPage: page });
-      
-      if (!groupInfo && res) {
-        groupInfo = {
-          groupId: res.groupId,
-          name: res.name || `Nhóm Zalo ${res.groupId}`,
-          avatar: res.avt || res.fullAvt || '',
-          totalMember: res.totalMember || 0
-        };
-      }
-
-      if (res && res.currentMems) {
-        allMembers.push(...res.currentMems);
-      }
-
-      if (res && res.hasMoreMember === 1) {
-        page++;
-        await new Promise(r => setTimeout(r, 1000)); // Delay tránh rate limit
-      } else {
-        hasMore = false;
-      }
-    }
-
-    if (!groupInfo) {
+    
+    // 1. Lấy groupInfo từ link (chỉ cần lấy trang 1 để có groupId)
+    const res = await api.getGroupLinkInfo({ link: groupLink, memberPage: 1 });
+    if (!res || !res.groupId) {
       throw new Error('Không thể lấy thông tin nhóm. Link không hợp lệ hoặc nhóm đã bị giải tán.');
     }
 
-    console.log(`[ZCA Worker] Quét được tổng cộng ${allMembers.length} thành viên từ link nhóm "${groupInfo.name}".`);
+    const groupInfo = {
+      groupId: res.groupId,
+      name: res.name || `Nhóm Zalo ${res.groupId}`,
+      avatar: res.avt || res.fullAvt || '',
+      totalMember: res.totalMember || 0
+    };
 
-    // 2. Lưu/Cập nhật thông tin Nhóm vào bảng Group
-    let groupRecord = await Group.findOne({ accountId, zaloId: groupInfo.groupId });
-    if (!groupRecord) {
-      groupRecord = new Group({
-        accountId,
-        zaloId: groupInfo.groupId, // groupId toàn cầu của Zalo
-        name: groupInfo.name,
-        avatar: groupInfo.avatar,
-        type: 'group_from_link',
-        memberCount: allMembers.length
+    // 2. Thu thập TÊN hiển thị từ link (cực kỳ quan trọng vì getmg chỉ trả UID cho người lạ)
+    let linkMembersDict = {};
+    console.log(`[ZCA Worker] Đang quét Tên thành viên qua API link phân trang...`);
+    if (res.currentMems) {
+      res.currentMems.forEach(m => {
+        const id = (m.id || m.uid || m.userId || m.zaloId || '').toString();
+        if (id) linkMembersDict[id] = m;
       });
-      await groupRecord.save();
-      console.log(`[ZCA Worker] Đã tạo mới bản ghi nhóm "${groupInfo.name}" trong CSDL.`);
+    }
+    
+    let page = 1;
+    let hasMore = (res.hasMoreMember === 1);
+    while (hasMore) {
+      page++;
+      try {
+        const pageRes = await api.getGroupLinkInfo({ link: groupLink, memberPage: page });
+        if (pageRes && pageRes.currentMems) {
+          pageRes.currentMems.forEach(m => {
+            const id = (m.id || m.uid || m.userId || m.zaloId || '').toString();
+            if (id) linkMembersDict[id] = m;
+          });
+        }
+        if (pageRes && pageRes.hasMoreMember === 1) {
+          await new Promise(r => setTimeout(r, 600)); // Delay tránh rate limit
+        } else {
+          hasMore = false;
+        }
+      } catch (err) {
+        console.log(`[ZCA Worker] Dừng phân trang ở page ${page} do lỗi hoặc hết quyền:`, err.message);
+        hasMore = false;
+      }
+    }
+    console.log(`[ZCA Worker] ✅ Thu thập được ${Object.keys(linkMembersDict).length} hồ sơ CÓ TÊN từ Link.`);
+
+    // 3. Thử lấy danh sách toàn bộ UID bằng getmg API (vét cạn, kể cả người Zalo ẩn khỏi link)
+    try {
+      const account = await Account.findOne({ phoneNumber: accountId });
+      if (account && account.zcaCredentials) {
+        const credentials = account.zcaCredentials;
+        let cookieStr = credentials.cookie;
+        if (Array.isArray(cookieStr)) {
+          cookieStr = cookieStr.map(c => `${c.name}=${c.value}`).join('; ');
+        }
+        const imei = credentials.imei;
+        const zpw_enk = await fetchZpwEnk(cookieStr, imei);
+        
+        if (zpw_enk) {
+          console.log(`[ZCA Worker] Đang vét cạn UID qua getmg...`);
+          const membersData = await fetchGroupMembersByMg(cookieStr, imei, zpw_enk, res.groupId);
+          if (membersData && membersData.length > 0) {
+            allMembers = membersData;
+            console.log(`[ZCA Worker] ✅ Vét được ${allMembers.length} UID qua getmg.`);
+          }
+        }
+      }
+    } catch (err) {
+      console.log(`[ZCA Worker] Lỗi gọi API getmg:`, err.message);
+    }
+
+    // 4. Gộp dữ liệu: Đảm bảo lấy TÊN từ linkMembersDict đắp vào allMembers
+    if (allMembers.length === 0) {
+      allMembers = Object.values(linkMembersDict);
     } else {
-      groupRecord.name = groupInfo.name;
-      groupRecord.avatar = groupInfo.avatar;
-      groupRecord.memberCount = allMembers.length;
-      await groupRecord.save();
+      // Đắp thông tin Tên/Avatar từ linkMembersDict sang allMembers
+      allMembers = allMembers.map(m => {
+        const mId = (m.id || m.uid || m.userId || m.uin || m.zaloId || '').toString();
+        if (mId && linkMembersDict[mId]) {
+          return { ...m, ...linkMembersDict[mId] };
+        }
+        return m;
+      });
+      // Nếu có người nào trong linkMembersDict mà getmg sót, thì add thêm vào
+      const existingIds = new Set(allMembers.map(m => (m.id || m.uid || m.userId || m.uin || m.zaloId || '').toString()));
+      Object.values(linkMembersDict).forEach(lm => {
+        const lmId = (lm.id || lm.uid || lm.userId || lm.zaloId || '').toString();
+        if (lmId && !existingIds.has(lmId)) {
+          allMembers.push(lm);
+        }
+      });
     }
 
-    // 3. Xử lý lưu thành viên vào GroupMember
-    if (allMembers.length > 0) {
-      const membersToSave = allMembers.map(m => ({
-        accountId,
-        groupId: groupRecord._id, // Khóa ngoại trỏ đến _id của Group trong MongoDB
-        zaloId: m.id,             // UID thật được cấp cục bộ cho nick này
-        displayName: m.zaloName || m.dName || '',
-        name: m.dName || m.zaloName || `Thành viên ${m.id.substring(0, 8)}`,
-        avatar: m.avatar || m.avatar_25 || '',
-      }));
+    console.log(`[ZCA Worker] Quét được tổng cộng ${allMembers.length} thành viên gốc từ link nhóm "${groupInfo.name}".`);
 
-      // Xóa thành viên cũ (thuộc Group này và Account này) trước khi insert mới
-      await GroupMember.deleteMany({ accountId, groupId: groupRecord._id });
-      await GroupMember.insertMany(membersToSave);
+    // 5. Thử dùng getUserInfo vét nốt tên cho những người bị ẩn tên (Nhóm kín)
+    const membersWithoutName = allMembers.filter(m => {
+      const name = m.zaloName || m.dName || m.dpn || m.displayName || m.name;
+      return !name || name.toString().startsWith('Thành viên');
+    });
+
+    if (membersWithoutName.length > 0) {
+      console.log(`[ZCA Worker] Còn ${membersWithoutName.length} UID chưa có tên (do nhóm kín), ép dùng getUserInfo để vét...`);
+      const BATCH_SIZE = 50;
+      const uidsWithoutName = membersWithoutName.map(m => (m.id || m.uid || m.userId || m.uin || m.zaloId || '').toString()).filter(id => id);
       
-      console.log(`[ZCA Worker] ✅ Đã lưu ${membersToSave.length} thành viên từ link vào DB thành công.`);
+      for (let i = 0; i < uidsWithoutName.length; i += BATCH_SIZE) {
+        const batch = uidsWithoutName.slice(i, i + BATCH_SIZE);
+        try {
+          const profilesRes = await api.getUserInfo(batch);
+          const changedProfiles = profilesRes.changed_profiles || {};
+
+          for (const uid of batch) {
+            const profile = changedProfiles[`${uid}_0`] || changedProfiles[uid] || {};
+            if (profile.displayName || profile.zaloName) {
+               const m = allMembers.find(x => (x.id || x.uid || x.userId || x.uin || x.zaloId || '').toString() === uid);
+               if (m) {
+                 m.zaloName = profile.zaloName || profile.displayName;
+                 m.avatar = profile.avatar || m.avatar || m.avt;
+               }
+            }
+          }
+        } catch (err) {
+          console.log(`[ZCA Worker] Bỏ qua getUserInfo batch ${i} do Zalo chặn (rate limit/quyền riêng tư).`);
+        }
+        
+        // Delay để tránh Zalo block API khi hỏi tên người lạ quá nhanh
+        if (i + BATCH_SIZE < uidsWithoutName.length) {
+          await new Promise(r => setTimeout(r, 500));
+        }
+      }
     }
 
-    return { success: true, count: allMembers.length, groupName: groupInfo.name };
+    // --- LỌC BỎ TRƯỞNG NHÓM VÀ PHÓ NHÓM ---
+    const creatorId = res.creatorId ? res.creatorId.toString() : null;
+    const adminIds = Array.isArray(res.adminIds) ? res.adminIds.map(id => id.toString()) : (Array.isArray(res.admins) ? res.admins.map(id => id.toString()) : []);
+    const adminSet = new Set(adminIds);
+    if (creatorId) adminSet.add(creatorId);
+
+    const originalLength = allMembers.length;
+    allMembers = allMembers.filter(m => {
+      const mId = (typeof m === 'string' ? m : (m.id || m.uid || m.userId || m.uin || m.zaloId || '')).toString();
+      if (adminSet.has(mId)) return false; // Lọc theo danh sách admin ID lấy từ groupInfo
+      
+      if (typeof m === 'object') {
+        const role = m.role !== undefined ? m.role : m.roleId;
+        // Role 1 = Trưởng nhóm, Role 2 = Phó nhóm. Role 0 = Thành viên thường
+        if (role === 1 || role === 2 || m.isAdmin || m.isCreator || m.isDeputy) {
+          return false;
+        }
+      }
+      return true;
+    });
+
+    console.log(`[ZCA Worker] Đã loại bỏ ${originalLength - allMembers.length} Trưởng/Phó nhóm. Còn lại: ${allMembers.length} thành viên thường.`);
+
+    // Không lưu Nhóm vào DB theo yêu cầu mới
+    
+    // 5. Xử lý danh sách thành viên để xuất Excel
+    let membersToSave = [];
+    if (allMembers.length > 0) {
+      console.log(`[ZCA Worker] Đang lấy tên profile cho ${allMembers.length} thành viên...`);
+      // Bóc tách UID từ allMembers và lọc trùng
+      const memberUids = [...new Set(allMembers.map(m => typeof m === 'string' ? m : (m.id || m.uid || m.userId || m.uin || m.zaloId || '')))].filter(id => id);
+      
+      const BATCH_SIZE = 50;
+      
+      for (let i = 0; i < memberUids.length; i += BATCH_SIZE) {
+        const batch = memberUids.slice(i, i + BATCH_SIZE);
+        try {
+          const profilesRes = await api.getUserInfo(batch);
+          const changedProfiles = profilesRes.changed_profiles || {};
+
+          for (const uid of batch) {
+            const profile = changedProfiles[`${uid}_0`] || changedProfiles[uid] || {};
+            
+            // Tìm trong allMembers xem có tên cũ không (phòng trường hợp getUserInfo thất bại)
+            const m = allMembers.find(x => (typeof x === 'object') && (x.id === uid || x.uid === uid || x.userId === uid || x.uin === uid || x.zaloId === uid));
+            const fallbackName = typeof m === 'object' ? (m.zaloName || m.dName || m.dpn || m.displayName) : null;
+            const finalName = profile.displayName || profile.zaloName || fallbackName || `Thành viên ${uid.substring(0, 8)}`;
+            
+            membersToSave.push({
+              accountId,
+              zaloId: uid,
+              displayName: profile.zaloName || profile.displayName || '',
+              name: finalName,
+              avatar: profile.avatar || (typeof m === 'object' ? (m.avatar || m.avatar_25 || m.avt) : '') || '',
+            });
+          }
+        } catch (batchErr) {
+          console.log(`[ZCA Worker] Cảnh báo: Lỗi khi lấy info batch thành viên ${i}-${i + BATCH_SIZE}:`, batchErr.message);
+          // Vẫn lưu UID dù không có tên
+          for (const uid of batch) {
+            const m = allMembers.find(x => (typeof x === 'object') && (x.id === uid || x.uid === uid || x.userId === uid || x.uin === uid || x.zaloId === uid));
+            const fallbackName = typeof m === 'object' ? (m.zaloName || m.dName || m.dpn || m.displayName) : null;
+            const finalName = fallbackName || `Thành viên ${uid.substring(0, 8)}`;
+            
+            membersToSave.push({
+              accountId,
+              zaloId: uid,
+              displayName: '',
+              name: finalName,
+              avatar: typeof m === 'object' ? (m.avatar || m.avatar_25 || m.avt || '') : '',
+            });
+          }
+        }
+        
+        // Delay nhỏ giữa các batch
+        if (i + BATCH_SIZE < memberUids.length) {
+          await new Promise(r => setTimeout(r, 300));
+        }
+      }
+
+      console.log(`[ZCA Worker] ✅ Đã xử lý ${membersToSave.length} thành viên từ link, sẵn sàng xuất Excel (Không lưu DB).`);
+    }
+
+    return { success: true, count: allMembers.length, groupName: groupInfo.name, members: membersToSave };
   } catch (error) {
     console.error(`[ZCA Worker] ❌ Lỗi quét nhóm qua link:`, error.message);
     throw error;

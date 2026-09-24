@@ -27,3 +27,7 @@ test-zalo*.js
 
 # Playwright screenshots
 *.png
+
+# script 
+# ======= đẩy vào trong file script ========
+zalo-api.worker.js
